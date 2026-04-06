@@ -60,6 +60,8 @@ node-tool version
 - `warm-cache` 已实现 `json / env / direct-domains / webtest 节点级产物与聚合物料` 四类缓存预热
 - `json2node --reuse-ids` 已支持按 `_identity / _source_scope + _identity_secondary / _identity_primary` 复用旧节点
 - `plan` 已输出 `added / updated / removed / moved / current_before / current_after / failover_before / failover_after / final_order`
+- `plan --format shell` 已提供稳定的 `TAB` 分隔行协议，便于 shell 直接消费
+- `add-node / json2node` 已支持重复节点自动 `skipped`，显式 `_id` 冲突直接报错
 - `webtest` 运行结果缓存后续再接
 
 ## 第一阶段目标
