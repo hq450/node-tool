@@ -59,6 +59,9 @@ const QueryOptions = struct {
     stdin_input: bool = false,
     all: bool = false,
     all_subscribe: bool = false,
+    warm_env: bool = false,
+    warm_json: bool = false,
+    warm_direct_domains: bool = false,
     socket_path: []const u8 = skipd_socket_path_default,
 };
 
@@ -397,7 +400,11 @@ fn run() !void {
                 else => unreachable,
             }
         },
-        .warm_cache => try runStub("warm-cache", options.query),
+        .warm_cache => {
+            var state = try loadSchema2State(allocator, options.query.socket_path);
+            defer state.deinit(allocator);
+            try runWarmCache(allocator, &state, options.query);
+        },
     }
 }
 
@@ -494,6 +501,12 @@ fn parseArgs(args: []const []const u8) !Options {
             query.all = true;
         } else if (std.mem.eql(u8, arg, "--all-subscribe")) {
             query.all_subscribe = true;
+        } else if (std.mem.eql(u8, arg, "--env")) {
+            query.warm_env = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            query.warm_json = true;
+        } else if (std.mem.eql(u8, arg, "--direct-domains")) {
+            query.warm_direct_domains = true;
         } else if (std.mem.eql(u8, arg, "--socket")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -753,6 +766,30 @@ fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOption
     } else {
         try writePlanJson(allocator, std.fs.File.stdout().deprecatedWriter(), &plan);
     }
+}
+
+fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    var targets = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, targets);
+    try filterNodeSliceInPlace(allocator, &targets, query);
+
+    const do_env = query.warm_env or (!query.warm_json and !query.warm_direct_domains);
+    const do_json = query.warm_json or (!query.warm_env and !query.warm_direct_domains);
+    const do_direct = query.warm_direct_domains or (!query.warm_env and !query.warm_json);
+
+    var json_count: usize = 0;
+    var env_count: usize = 0;
+    var direct_count: usize = 0;
+
+    if (do_json) json_count = try warmJsonCache(allocator, targets);
+    if (do_env) env_count = try warmEnvCache(allocator, targets);
+    if (do_direct) direct_count = try warmDirectDomainsCache(allocator, state.nodes);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: warm-cache\n", .{});
+    try stdout.print("json: {d}\n", .{json_count});
+    try stdout.print("env: {d}\n", .{env_count});
+    try stdout.print("direct_domains: {d}\n", .{direct_count});
 }
 
 fn runStub(command_name: []const u8, query: QueryOptions) !void {
@@ -1451,6 +1488,236 @@ fn renderPlanItemJsonAlloc(allocator: std.mem.Allocator, item: PlanItem) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+fn warmJsonCache(allocator: std.mem.Allocator, nodes: []const NodeRecord) !usize {
+    const cache_dir = "/koolshare/configs/fancyss/node_json_cache";
+    const tmp_dir = "/koolshare/configs/fancyss/node_json_cache.tmp.node_tool";
+    const old_dir = "/koolshare/configs/fancyss/node_json_cache.old.node_tool";
+    const meta_file = "/koolshare/configs/fancyss/node_json_cache.meta";
+    const index_file = "/koolshare/configs/fancyss/node_json_cache/nodes_index.txt";
+    _ = index_file;
+
+    try ensureCleanDir(tmp_dir);
+    for (nodes) |node| {
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ tmp_dir, node.id });
+        defer allocator.free(file_path);
+        try writeFileAtomic(file_path, node.raw_json);
+    }
+    try writeJsonIndexFile(allocator, tmp_dir, nodes);
+    try replaceDirAtomic(cache_dir, tmp_dir, old_dir);
+    try writeSimpleMeta(meta_file, "config_ts", nowMs());
+    return nodes.len;
+}
+
+fn warmEnvCache(allocator: std.mem.Allocator, nodes: []const NodeRecord) !usize {
+    const cache_dir = "/koolshare/configs/fancyss/node_env_cache";
+    const tmp_dir = "/koolshare/configs/fancyss/node_env_cache.tmp.node_tool";
+    const old_dir = "/koolshare/configs/fancyss/node_env_cache.old.node_tool";
+    const meta_file = "/koolshare/configs/fancyss/node_env_cache.meta";
+    const obfs_file = "/koolshare/configs/fancyss/node_env_cache/ss_obfs_ids.txt";
+
+    try ensureCleanDir(tmp_dir);
+    var obfs_ids = std.ArrayList(u8){};
+    defer obfs_ids.deinit(allocator);
+
+    for (nodes) |node| {
+        const env_path = try std.fmt.allocPrint(allocator, "{s}/{s}.env", .{ tmp_dir, node.id });
+        defer allocator.free(env_path);
+        const env_content = try renderNodeEnvAlloc(allocator, node.raw_json);
+        defer allocator.free(env_content);
+        try writeFileAtomic(env_path, env_content);
+
+        if (std.mem.eql(u8, node.type_id, "0")) {
+            if (containsSsObfs(node.raw_json)) {
+                if (obfs_ids.items.len > 0) try obfs_ids.append(allocator, '\n');
+                try obfs_ids.appendSlice(allocator, node.id);
+            }
+        }
+    }
+
+    const obfs_path = try allocator.dupe(u8, try std.fmt.allocPrint(allocator, "{s}/ss_obfs_ids.txt", .{tmp_dir}));
+    defer allocator.free(obfs_path);
+    try writeFileAtomic(obfs_path, obfs_ids.items);
+    try replaceDirAtomic(cache_dir, tmp_dir, old_dir);
+    try writeSimpleMeta(meta_file, "config_ts", nowMs());
+    _ = obfs_file;
+    return nodes.len;
+}
+
+fn warmDirectDomainsCache(allocator: std.mem.Allocator, nodes: []const NodeRecord) !usize {
+    const cache_file = "/koolshare/configs/fancyss/node_direct_domains.txt";
+    const meta_file = "/koolshare/configs/fancyss/node_direct_domains.meta";
+    var domains = std.ArrayList([]const u8){};
+    defer domains.deinit(allocator);
+
+    for (nodes) |node| {
+        if (node.server.len == 0) continue;
+        if (!looksLikeDomain(node.server)) continue;
+        if (containsSlice(domains.items, node.server)) continue;
+        try domains.append(allocator, node.server);
+    }
+
+    std.mem.sort([]const u8, domains.items, {}, lessThanString);
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    for (domains.items, 0..) |domain, idx| {
+        if (idx > 0) try writer.writeByte('\n');
+        try writer.writeAll(domain);
+    }
+    if (out.items.len > 0) try writer.writeByte('\n');
+    try writeFileAtomic(cache_file, out.items);
+    try writeSimpleMeta(meta_file, "catalog_ts", nowMs());
+    return domains.items.len;
+}
+
+fn ensureCleanDir(path: []const u8) !void {
+    std.fs.cwd().deleteTree(path) catch {};
+    try std.fs.cwd().makePath(path);
+}
+
+fn replaceDirAtomic(target: []const u8, tmp_dir: []const u8, old_dir: []const u8) !void {
+    std.fs.cwd().deleteTree(old_dir) catch {};
+    std.fs.cwd().rename(target, old_dir) catch {};
+    try std.fs.cwd().rename(tmp_dir, target);
+    std.fs.cwd().deleteTree(old_dir) catch {};
+}
+
+fn writeFileAtomic(path: []const u8, content: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+}
+
+fn writeSimpleMeta(path: []const u8, key: []const u8, value: u64) !void {
+    const content = try std.fmt.allocPrint(std.heap.c_allocator, "{s}={d}\n", .{ key, value });
+    defer std.heap.c_allocator.free(content);
+    try writeFileAtomic(path, content);
+}
+
+fn writeJsonIndexFile(allocator: std.mem.Allocator, dir_path: []const u8, nodes: []const NodeRecord) !void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    for (nodes) |node| {
+        const method = try extractStringFieldAlloc(allocator, node.raw_json, "method");
+        defer if (method) |value| allocator.free(value);
+        const ss_obfs = try extractStringFieldAlloc(allocator, node.raw_json, "ss_obfs");
+        defer if (ss_obfs) |value| allocator.free(value);
+        const type_padded = if (node.type_id.len == 1)
+            try std.fmt.allocPrint(allocator, "0{s}", .{node.type_id})
+        else
+            try allocator.dupe(u8, node.type_id);
+        defer allocator.free(type_padded);
+        try writer.print("{s}|{s}|{s}|{s}\n", .{
+            node.id,
+            type_padded,
+            if (ss_obfs) |value| value else "",
+            if (method) |value| value else "",
+        });
+    }
+    const path = try std.fmt.allocPrint(allocator, "{s}/nodes_index.txt", .{dir_path});
+    defer allocator.free(path);
+    try writeFileAtomic(path, out.items);
+}
+
+fn renderNodeEnvAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+
+    var keys = std.ArrayList([]const u8){};
+    defer keys.deinit(allocator);
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.key_ptr.*.len == 0) continue;
+        if (entry.key_ptr.*[0] == '_') continue;
+        if (entry.value_ptr.* == .null) continue;
+        const rendered = try jsonValueToPlainStringAlloc(allocator, entry.value_ptr.*);
+        defer allocator.free(rendered);
+        if (rendered.len == 0) continue;
+        try keys.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+    }
+    defer for (keys.items) |key| allocator.free(key);
+    std.mem.sort([]const u8, keys.items, {}, lessThanString);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeAll("WT_NODE_ENV_FIELDS=");
+    for (keys.items, 0..) |key, idx| {
+        if (idx > 0) try writer.writeByte(' ');
+        try writer.writeAll(key);
+    }
+    try writer.writeByte('\n');
+
+    for (keys.items) |key| {
+        const value = parsed.value.object.get(key).?;
+        const plain = try jsonValueToPlainStringAlloc(allocator, value);
+        defer allocator.free(plain);
+        const quoted = try shellQuoteAlloc(allocator, plain);
+        defer allocator.free(quoted);
+        try writer.print("WTN_{s}={s}\n", .{ key, quoted });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn jsonValueToPlainStringAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return switch (value) {
+        .string => try allocator.dupe(u8, value.string),
+        .integer => try std.fmt.allocPrint(allocator, "{d}", .{value.integer}),
+        .float => try std.fmt.allocPrint(allocator, "{d}", .{value.float}),
+        .bool => try allocator.dupe(u8, if (value.bool) "1" else "0"),
+        .number_string => try allocator.dupe(u8, value.number_string),
+        .null => try allocator.dupe(u8, ""),
+        else => try renderCompactJsonAlloc(allocator, value),
+    };
+}
+
+fn shellQuoteAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeByte('\'');
+    for (input) |ch| {
+        if (ch == '\'') {
+            try writer.writeAll("'\\''");
+        } else {
+            try writer.writeByte(ch);
+        }
+    }
+    try writer.writeByte('\'');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn containsSsObfs(raw_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, raw_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("ss_obfs") orelse return false;
+    if (value != .string) return false;
+    return std.mem.eql(u8, value.string, "http") or std.mem.eql(u8, value.string, "tls");
+}
+
+fn looksLikeDomain(host: []const u8) bool {
+    if (host.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return false;
+    if (std.mem.indexOfScalar(u8, host, '.') == null) return false;
+    var all_numeric_or_dot = true;
+    for (host) |ch| {
+        if ((ch >= '0' and ch <= '9') or ch == '.') continue;
+        all_numeric_or_dot = false;
+        break;
+    }
+    return !all_numeric_or_dot;
+}
+
+fn containsSlice(items: []const []const u8, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, value)) return true;
+    }
+    return false;
+}
+
 fn reorderNodeRecordsAlloc(allocator: std.mem.Allocator, nodes: []NodeRecord, order_csv: ?[]const u8) ![]NodeRecord {
     if (nodes.len == 0) return try allocator.alloc(NodeRecord, 0);
 
@@ -2117,7 +2384,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
-        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--ids 1,2,3]\n"),
+        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
