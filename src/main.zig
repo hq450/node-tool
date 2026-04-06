@@ -320,6 +320,14 @@ const PlanSummary = struct {
     updated: std.ArrayList(PlanItem),
     removed: std.ArrayList(PlanItem),
     moved: std.ArrayList(PlanItem),
+    current_before_id: []u8,
+    current_before_identity: []u8,
+    current_after_id: []u8,
+    current_after_identity: []u8,
+    failover_before_id: []u8,
+    failover_before_identity: []u8,
+    failover_after_id: []u8,
+    failover_after_identity: []u8,
     final_order: []u8,
     final_count: usize,
     order_changed: bool,
@@ -333,6 +341,14 @@ const PlanSummary = struct {
         self.removed.deinit(allocator);
         for (self.moved.items) |*item| item.deinit(allocator);
         self.moved.deinit(allocator);
+        allocator.free(self.current_before_id);
+        allocator.free(self.current_before_identity);
+        allocator.free(self.current_after_id);
+        allocator.free(self.current_after_identity);
+        allocator.free(self.failover_before_id);
+        allocator.free(self.failover_before_identity);
+        allocator.free(self.failover_after_id);
+        allocator.free(self.failover_after_identity);
         allocator.free(self.final_order);
     }
 };
@@ -667,7 +683,7 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
         try importNodeDocument(allocator, state, raw_doc, query, "tail", &added, &updated);
     }
 
-    var plan = try buildPlanSummary(allocator, old_nodes, state.nodes);
+    var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
     defer plan.deinit(allocator);
 
     if (!query.dry_run) {
@@ -769,8 +785,9 @@ fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOption
     for (docs) |raw_doc| {
         try importNodeDocument(allocator, &draft, raw_doc, query, "tail", &added, &updated);
     }
+    try reconcileReferenceState(allocator, &draft);
 
-    var plan = try buildPlanSummary(allocator, old_nodes, draft.nodes);
+    var plan = try buildPlanSummary(allocator, state, old_nodes, &draft, draft.nodes);
     defer plan.deinit(allocator);
 
     const format = query.format orelse "json";
@@ -1431,7 +1448,7 @@ fn lessThanNodeRecord(ctx: SortContext, lhs: NodeRecord, rhs: NodeRecord) bool {
     return std.ascii.orderIgnoreCase(lhs.name, rhs.name) == .lt;
 }
 
-fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord, new_nodes: []const NodeRecord) !PlanSummary {
+fn buildPlanSummary(allocator: std.mem.Allocator, old_state: *const SchemaState, old_nodes: []const NodeRecord, new_state: *const SchemaState, new_nodes: []const NodeRecord) !PlanSummary {
     var added = std.ArrayList(PlanItem){};
     errdefer {
         for (added.items) |*item| item.deinit(allocator);
@@ -1486,6 +1503,14 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord,
         .updated = updated,
         .removed = removed,
         .moved = moved,
+        .current_before_id = try allocator.dupe(u8, old_state.current_id),
+        .current_before_identity = try allocator.dupe(u8, old_state.current_identity),
+        .current_after_id = try allocator.dupe(u8, new_state.current_id),
+        .current_after_identity = try allocator.dupe(u8, new_state.current_identity),
+        .failover_before_id = try allocator.dupe(u8, old_state.failover_id),
+        .failover_before_identity = try allocator.dupe(u8, old_state.failover_identity),
+        .failover_after_id = try allocator.dupe(u8, new_state.failover_id),
+        .failover_after_identity = try allocator.dupe(u8, new_state.failover_identity),
         .final_order = final_order,
         .final_count = new_nodes.len,
         .order_changed = !std.mem.eql(u8, old_order, final_order),
@@ -1512,6 +1537,10 @@ fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
     for (plan.moved.items) |item| try writer.print("  > {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("final_count: {d}\n", .{plan.final_count});
     try writer.print("order_changed: {s}\n", .{if (plan.order_changed) "1" else "0"});
+    try writer.print("current_before: {s} {s}\n", .{ plan.current_before_id, plan.current_before_identity });
+    try writer.print("current_after: {s} {s}\n", .{ plan.current_after_id, plan.current_after_identity });
+    try writer.print("failover_before: {s} {s}\n", .{ plan.failover_before_id, plan.failover_before_identity });
+    try writer.print("failover_after: {s} {s}\n", .{ plan.failover_after_id, plan.failover_after_identity });
     try writer.print("final_order: {s}\n", .{plan.final_order});
 }
 
@@ -1544,10 +1573,26 @@ fn writePlanJson(allocator: std.mem.Allocator, writer: anytype, plan: *PlanSumma
         defer allocator.free(rendered);
         try writer.writeAll(rendered);
     }
-    try writer.print("],\"final_count\":{d},\"order_changed\":{s},\"final_order\":", .{
+    try writer.print("],\"final_count\":{d},\"order_changed\":{s},\"current_before\":{{\"id\":", .{
         plan.final_count,
         if (plan.order_changed) "true" else "false",
     });
+    try writeJsonString(writer, plan.current_before_id);
+    try writer.writeAll(",\"identity\":");
+    try writeJsonString(writer, plan.current_before_identity);
+    try writer.writeAll("},\"current_after\":{\"id\":");
+    try writeJsonString(writer, plan.current_after_id);
+    try writer.writeAll(",\"identity\":");
+    try writeJsonString(writer, plan.current_after_identity);
+    try writer.writeAll("},\"failover_before\":{\"id\":");
+    try writeJsonString(writer, plan.failover_before_id);
+    try writer.writeAll(",\"identity\":");
+    try writeJsonString(writer, plan.failover_before_identity);
+    try writer.writeAll("},\"failover_after\":{\"id\":");
+    try writeJsonString(writer, plan.failover_after_id);
+    try writer.writeAll(",\"identity\":");
+    try writeJsonString(writer, plan.failover_after_identity);
+    try writer.writeAll("},\"final_order\":");
     try writeJsonString(writer, plan.final_order);
     try writer.writeAll("}\n");
 }
