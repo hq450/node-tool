@@ -53,9 +53,10 @@ node-tool version
 
 - `version` 可用
 - `list / stat / find / node2json` 已实现第一版只读能力
+- `json2node / add-node / delete-node` 已实现第一版写能力
 - 通过 Unix socket 直接访问 `skipd`，不依赖外部 `dbus` 可执行文件
 - 当前只支持 `schema2`
-- 写命令仍为占位，后续分阶段实现
+- `delete-nodes / warm-cache / reorder / plan` 仍需继续完善
 
 ## 第一阶段目标
 
@@ -65,12 +66,12 @@ node-tool version
 - `list`
 - `stat`
 - `find`
-
-后续优先实现：
-
 - `json2node`
 - `add-node`
 - `delete-node`
+
+后续优先实现：
+
 - `delete-nodes`
 - `warm-cache`
 
