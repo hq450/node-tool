@@ -14,6 +14,7 @@ const Command = enum {
     export_sources,
     prune_export_sources,
     node2json,
+    sync_source,
     json2node,
     add_node,
     delete_node,
@@ -562,10 +563,11 @@ fn run() !void {
             defer state.deinit(allocator);
             try runFindDuplicates(allocator, &state, options.query);
         },
-        .json2node, .add_node, .delete_node, .delete_nodes => {
+        .sync_source, .json2node, .add_node, .delete_node, .delete_nodes => {
             var state = try loadSchema2State(allocator, options.query.socket_path);
             defer state.deinit(allocator);
             switch (options.command) {
+                .sync_source => try runSyncSource(allocator, &state, options.query),
                 .json2node => try runJson2Node(allocator, &state, options.query),
                 .add_node => try runAddNode(allocator, &state, options.query),
                 .delete_node => try runDeleteNode(allocator, &state, options.query),
@@ -607,6 +609,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "export-sources")) break :blk Command.export_sources;
         if (std.mem.eql(u8, args[1], "prune-export-sources")) break :blk Command.prune_export_sources;
         if (std.mem.eql(u8, args[1], "node2json")) break :blk Command.node2json;
+        if (std.mem.eql(u8, args[1], "sync-source")) break :blk Command.sync_source;
         if (std.mem.eql(u8, args[1], "json2node")) break :blk Command.json2node;
         if (std.mem.eql(u8, args[1], "add-node")) break :blk Command.add_node;
         if (std.mem.eql(u8, args[1], "delete-node")) break :blk Command.delete_node;
@@ -1003,6 +1006,8 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     const input_bytes = try readInputCompatAlloc(allocator, query.input, query.stdin_input or query.input == null, max_skipd_frame);
     defer allocator.free(input_bytes);
 
+    var old_state = try cloneSchemaState(allocator, state.*);
+    defer old_state.deinit(allocator);
     const old_nodes = try cloneNodeSlice(allocator, state.nodes);
     defer freeNodeSlice(allocator, old_nodes);
 
@@ -1027,7 +1032,8 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
         }
     }
 
-    var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
+    try reconcileReferenceState(allocator, state);
+    var plan = try buildPlanSummary(allocator, &old_state, old_nodes, state, state.nodes);
     defer plan.deinit(allocator);
 
     if (query.normalized_output) |normalized_output| {
@@ -1041,6 +1047,114 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
     try printMutationSummary("json2node", plan.added.items.len, plan.updated.items.len, plan.removed.items.len, skipped, state.nodes.len, query.dry_run);
+}
+
+fn runSyncSource(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    const target_tag = query.source_tag orelse return error.InvalidArguments;
+    const input_bytes = try readInputCompatAlloc(allocator, query.input, query.stdin_input or query.input == null, max_skipd_frame);
+    defer allocator.free(input_bytes);
+
+    var old_state = try cloneSchemaState(allocator, state.*);
+    defer old_state.deinit(allocator);
+    const old_nodes = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, old_nodes);
+
+    const docs = try parseInputJsonDocumentsAlloc(allocator, input_bytes);
+    defer freeStringSlice(allocator, docs);
+
+    var old_source_nodes = std.ArrayList(NodeRecord){};
+    defer {
+        for (old_source_nodes.items) |*node| node.deinit(allocator);
+        old_source_nodes.deinit(allocator);
+    }
+    for (old_nodes) |node| {
+        if (!std.mem.eql(u8, node.source_tag, target_tag)) continue;
+        try old_source_nodes.append(allocator, .{
+            .id = try allocator.dupe(u8, node.id),
+            .type_id = try allocator.dupe(u8, node.type_id),
+            .protocol = try allocator.dupe(u8, node.protocol),
+            .protocol_label = try allocator.dupe(u8, node.protocol_label),
+            .name = try allocator.dupe(u8, node.name),
+            .group = try allocator.dupe(u8, node.group),
+            .source = try allocator.dupe(u8, node.source),
+            .source_tag = try allocator.dupe(u8, node.source_tag),
+            .airport_identity = try allocator.dupe(u8, node.airport_identity),
+            .source_scope = try allocator.dupe(u8, node.source_scope),
+            .source_url_hash = try allocator.dupe(u8, node.source_url_hash),
+            .identity = try allocator.dupe(u8, node.identity),
+            .identity_primary = try allocator.dupe(u8, node.identity_primary),
+            .identity_secondary = try allocator.dupe(u8, node.identity_secondary),
+            .server = try allocator.dupe(u8, node.server),
+            .port = try allocator.dupe(u8, node.port),
+            .schema = node.schema,
+            .rev = node.rev,
+            .created_at = node.created_at,
+            .updated_at = node.updated_at,
+            .raw_json = try allocator.dupe(u8, node.raw_json),
+        });
+    }
+
+    var source_state = SchemaState{
+        .nodes = try allocator.alloc(NodeRecord, 0),
+        .current_id = try allocator.dupe(u8, ""),
+        .current_identity = try allocator.dupe(u8, ""),
+        .failover_id = try allocator.dupe(u8, ""),
+        .failover_identity = try allocator.dupe(u8, ""),
+        .next_id = state.next_id,
+    };
+    defer source_state.deinit(allocator);
+
+    var skipped: usize = 0;
+    for (docs) |raw_doc| {
+        const result = try importNodeDocument(allocator, &source_state, raw_doc, query, "tail", old_source_nodes.items);
+        if (result == .skipped) skipped += 1;
+    }
+    if (query.normalized_output) |normalized_output| {
+        try writeRawJsonlToPath(normalized_output, source_state.nodes);
+    }
+
+    var final_nodes = std.ArrayList(NodeRecord){};
+    defer final_nodes.deinit(allocator);
+    var inserted = false;
+    var saw_target = false;
+    for (state.nodes) |*node| {
+        if (std.mem.eql(u8, node.source_tag, target_tag)) {
+            saw_target = true;
+            if (!inserted) {
+                for (source_state.nodes) |new_node| {
+                    try final_nodes.append(allocator, new_node);
+                }
+                allocator.free(source_state.nodes);
+                source_state.nodes = try allocator.alloc(NodeRecord, 0);
+                inserted = true;
+            }
+            node.deinit(allocator);
+            continue;
+        }
+        try final_nodes.append(allocator, node.*);
+    }
+    if (!saw_target) {
+        for (source_state.nodes) |new_node| {
+            try final_nodes.append(allocator, new_node);
+        }
+        allocator.free(source_state.nodes);
+        source_state.nodes = try allocator.alloc(NodeRecord, 0);
+    }
+    allocator.free(state.nodes);
+    state.nodes = try final_nodes.toOwnedSlice(allocator);
+    state.next_id = source_state.next_id;
+
+    try reconcileReferenceState(allocator, state);
+    var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
+    defer plan.deinit(allocator);
+
+    if (query.plan_output) |plan_output| {
+        try writePlanToPath(allocator, plan_output, query.plan_format orelse "shell", &plan);
+    }
+    if (!query.dry_run) {
+        try writeSchema2State(allocator, query.socket_path, old_nodes, state);
+    }
+    try printMutationSummary("sync-source", plan.added.items.len, plan.updated.items.len, plan.removed.items.len, skipped, state.nodes.len, query.dry_run);
 }
 
 fn runAddNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -3761,6 +3875,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool export-sources [options]\n" ++
         "  node-tool prune-export-sources [options]\n" ++
         "  node-tool node2json [options]\n" ++
+        "  node-tool sync-source [options]\n" ++
         "  node-tool json2node [options]\n" ++
         "  node-tool add-node [options]\n" ++
         "  node-tool delete-node [options]\n" ++
@@ -3782,6 +3897,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
         .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
+        .sync_source => try writer.writeAll("Usage: node-tool sync-source --source-tag tag [--input nodes.jsonl | --stdin] [--reuse-ids] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
