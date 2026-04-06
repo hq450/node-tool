@@ -57,7 +57,8 @@ node-tool version
 - `delete-nodes / reorder / plan` 已实现第一版能力
 - 通过 Unix socket 直接访问 `skipd`，不依赖外部 `dbus` 可执行文件
 - 当前只支持 `schema2`
-- `warm-cache` 仍需继续完善
+- `warm-cache` 已实现 `json / env / direct-domains` 三类缓存预热
+- `webtest` 运行结果缓存后续再接
 
 ## 第一阶段目标
 
@@ -73,10 +74,12 @@ node-tool version
 - `delete-nodes`
 - `reorder`
 - `plan`
+- `warm-cache`
 
 后续优先实现：
 
-- `warm-cache`
+- 更完整的 `warm-cache`
+- 面向写库的 `plan`
 
 强烈建议一起做：
 
