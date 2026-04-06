@@ -11,6 +11,8 @@ const Command = enum {
     stat,
     find,
     find_duplicates,
+    export_sources,
+    prune_export_sources,
     node2json,
     json2node,
     add_node,
@@ -53,6 +55,12 @@ const QueryOptions = struct {
     format: ?[]const u8 = null,
     sort: ?[]const u8 = null,
     input: ?[]const u8 = null,
+    output_dir: ?[]const u8 = null,
+    meta_path: ?[]const u8 = null,
+    all_jsonl_path: ?[]const u8 = null,
+    active_source_tags_path: ?[]const u8 = null,
+    plan_output: ?[]const u8 = null,
+    plan_format: ?[]const u8 = null,
     position: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     canonical: bool = false,
@@ -306,6 +314,23 @@ const StatItem = struct {
     }
 };
 
+const SourceExportBucket = struct {
+    source: []u8,
+    key: []u8,
+    label: []u8,
+    path: []u8,
+    count: usize,
+    content: std.ArrayList(u8),
+
+    fn deinit(self: *SourceExportBucket, allocator: std.mem.Allocator) void {
+        allocator.free(self.source);
+        allocator.free(self.key);
+        allocator.free(self.label);
+        allocator.free(self.path);
+        self.content.deinit(allocator);
+    }
+};
+
 const PlanItem = struct {
     id: []u8,
     name: []u8,
@@ -361,11 +386,33 @@ const PlanFieldChange = struct {
     }
 };
 
+const ReconcileMapItem = struct {
+    match_reason: []u8,
+    old_id: []u8,
+    old_identity: []u8,
+    old_name: []u8,
+    new_id: []u8,
+    new_identity: []u8,
+    new_name: []u8,
+
+    fn deinit(self: *ReconcileMapItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.match_reason);
+        allocator.free(self.old_id);
+        allocator.free(self.old_identity);
+        allocator.free(self.old_name);
+        allocator.free(self.new_id);
+        allocator.free(self.new_identity);
+        allocator.free(self.new_name);
+    }
+};
+
 const PlanSummary = struct {
     added: std.ArrayList(PlanItem),
     updated: std.ArrayList(PlanItem),
     removed: std.ArrayList(PlanItem),
     moved: std.ArrayList(PlanItem),
+    mappings: std.ArrayList(ReconcileMapItem),
+    unmapped: std.ArrayList(ReconcileMapItem),
     current_before_id: []u8,
     current_before_identity: []u8,
     current_after_id: []u8,
@@ -387,6 +434,10 @@ const PlanSummary = struct {
         self.removed.deinit(allocator);
         for (self.moved.items) |*item| item.deinit(allocator);
         self.moved.deinit(allocator);
+        for (self.mappings.items) |*item| item.deinit(allocator);
+        self.mappings.deinit(allocator);
+        for (self.unmapped.items) |*item| item.deinit(allocator);
+        self.unmapped.deinit(allocator);
         allocator.free(self.current_before_id);
         allocator.free(self.current_before_identity);
         allocator.free(self.current_after_id);
@@ -488,7 +539,10 @@ fn run() !void {
             try std.fs.File.stdout().writeAll(app_version);
             try std.fs.File.stdout().writeAll("\n");
         },
-        .list, .stat, .find, .node2json => {
+        .prune_export_sources => {
+            try runPruneExportSources(allocator, options.query);
+        },
+        .list, .stat, .find, .export_sources, .node2json => {
             var nodes = try loadSchema2Nodes(allocator, options.query.socket_path);
             defer freeNodeSlice(allocator, nodes);
             try filterNodeSliceInPlace(allocator, &nodes, options.query);
@@ -497,6 +551,7 @@ fn run() !void {
                 .list => try runList(allocator, nodes, options.query),
                 .stat => try runStat(allocator, nodes, options.query),
                 .find => try runFind(allocator, nodes, options.query),
+                .export_sources => try runExportSources(allocator, nodes, options.query),
                 .node2json => try runNode2Json(allocator, nodes, options.query),
                 else => unreachable,
             }
@@ -548,6 +603,8 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "stat")) break :blk Command.stat;
         if (std.mem.eql(u8, args[1], "find")) break :blk Command.find;
         if (std.mem.eql(u8, args[1], "find-duplicates")) break :blk Command.find_duplicates;
+        if (std.mem.eql(u8, args[1], "export-sources")) break :blk Command.export_sources;
+        if (std.mem.eql(u8, args[1], "prune-export-sources")) break :blk Command.prune_export_sources;
         if (std.mem.eql(u8, args[1], "node2json")) break :blk Command.node2json;
         if (std.mem.eql(u8, args[1], "json2node")) break :blk Command.json2node;
         if (std.mem.eql(u8, args[1], "add-node")) break :blk Command.add_node;
@@ -612,6 +669,30 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.input = args[i];
+        } else if (std.mem.eql(u8, arg, "--output-dir")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.output_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--meta")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.meta_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--all-jsonl")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.all_jsonl_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--active-source-tags")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.active_source_tags_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--plan-output")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.plan_output = args[i];
+        } else if (std.mem.eql(u8, arg, "--plan-format")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.plan_format = args[i];
         } else if (std.mem.eql(u8, arg, "--stdin")) {
             query.stdin_input = true;
         } else if (std.mem.eql(u8, arg, "--position")) {
@@ -798,6 +879,121 @@ fn runStat(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOption
     }
 }
 
+fn runExportSources(allocator: std.mem.Allocator, nodes: []const NodeRecord, query: QueryOptions) !void {
+    const output_dir = query.output_dir orelse return error.InvalidArguments;
+    const meta_path = query.meta_path orelse return error.InvalidArguments;
+    const format = try resolveExportSourcesFormat(query.format);
+
+    std.fs.cwd().makePath(output_dir) catch |err| {
+        if (std.fs.cwd().openDir(output_dir, .{})) |opened_dir| {
+            var dir = opened_dir;
+            dir.close();
+        } else |_| {
+            return err;
+        }
+    };
+
+    var buckets = std.ArrayList(SourceExportBucket){};
+    defer {
+        for (buckets.items) |*bucket| bucket.deinit(allocator);
+        buckets.deinit(allocator);
+    }
+    var all_jsonl = std.ArrayList(u8){};
+    defer all_jsonl.deinit(allocator);
+
+    var next_sub_idx: usize = 0;
+    for (nodes) |node| {
+        const bucket_idx = try findOrCreateSourceBucket(allocator, &buckets, output_dir, node, &next_sub_idx);
+        var bucket = &buckets.items[bucket_idx];
+        try bucket.content.appendSlice(allocator, node.raw_json);
+        try bucket.content.append(allocator, '\n');
+        bucket.count += 1;
+
+        try all_jsonl.appendSlice(allocator, node.raw_json);
+        try all_jsonl.append(allocator, '\n');
+    }
+
+    if (query.all_jsonl_path) |all_jsonl_path| {
+        try writeFileAtomic(all_jsonl_path, all_jsonl.items);
+    }
+    try writeSourceBuckets(allocator, &buckets);
+    try writeSourceMetaFile(allocator, meta_path, buckets.items);
+
+    switch (format) {
+        .text => try writeSourceExportText(std.fs.File.stdout().deprecatedWriter(), buckets.items, nodes.len),
+        .shell => try writeSourceExportShell(std.fs.File.stdout().deprecatedWriter(), buckets.items, nodes.len),
+        .json => try writeSourceExportJson(allocator, std.fs.File.stdout().deprecatedWriter(), buckets.items, nodes.len),
+        else => unreachable,
+    }
+}
+
+fn runPruneExportSources(allocator: std.mem.Allocator, query: QueryOptions) !void {
+    const meta_path = query.meta_path orelse return error.InvalidArguments;
+    const active_path = query.active_source_tags_path orelse return error.InvalidArguments;
+    const format = try resolveExportSourcesFormat(query.format);
+
+    const meta_bytes = try readInputCompatAlloc(allocator, meta_path, false, max_skipd_frame);
+    defer allocator.free(meta_bytes);
+    const active_bytes = try readInputCompatAlloc(allocator, active_path, false, max_skipd_frame);
+    defer allocator.free(active_bytes);
+
+    var active_tags = std.ArrayList([]u8){};
+    defer freeStringSlice(allocator, active_tags.items);
+    var active_iter = std.mem.splitScalar(u8, active_bytes, '\n');
+    while (active_iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+        try active_tags.append(allocator, try allocator.dupe(u8, line));
+    }
+
+    var kept_meta = std.ArrayList(u8){};
+    defer kept_meta.deinit(allocator);
+    var removed = std.ArrayList(SourceExportBucket){};
+    defer {
+        for (removed.items) |*item| item.deinit(allocator);
+        removed.deinit(allocator);
+    }
+    var kept_count: usize = 0;
+
+    var line_iter = std.mem.splitScalar(u8, meta_bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const path = fields.next() orelse continue;
+        const count_raw = fields.next() orelse "0";
+        const key = fields.next() orelse "";
+        const label = fields.next() orelse "";
+        const count = std.fmt.parseInt(usize, count_raw, 10) catch 0;
+
+        if (key.len == 0 or std.mem.eql(u8, key, "user") or std.mem.eql(u8, key, "null") or containsSliceOwned(active_tags.items, key)) {
+            try kept_meta.appendSlice(allocator, line);
+            try kept_meta.append(allocator, '\n');
+            kept_count += 1;
+            continue;
+        }
+
+        std.fs.cwd().deleteFile(path) catch {};
+        try removed.append(allocator, .{
+            .source = try allocator.dupe(u8, "subscribe"),
+            .key = try allocator.dupe(u8, key),
+            .label = try allocator.dupe(u8, label),
+            .path = try allocator.dupe(u8, path),
+            .count = count,
+            .content = std.ArrayList(u8){},
+        });
+    }
+
+    try writeFileAtomic(meta_path, kept_meta.items);
+
+    switch (format) {
+        .text => try writePruneExportText(std.fs.File.stdout().deprecatedWriter(), kept_count, removed.items),
+        .shell => try writePruneExportShell(std.fs.File.stdout().deprecatedWriter(), kept_count, removed.items),
+        .json => try writePruneExportJson(allocator, std.fs.File.stdout().deprecatedWriter(), kept_count, removed.items),
+        else => unreachable,
+    }
+}
+
 fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
     const input_bytes = try readInputCompatAlloc(allocator, query.input, query.stdin_input or query.input == null, max_skipd_frame);
     defer allocator.free(input_bytes);
@@ -828,6 +1024,10 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
 
     var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
     defer plan.deinit(allocator);
+
+    if (query.plan_output) |plan_output| {
+        try writePlanToPath(allocator, plan_output, query.plan_format orelse "shell", &plan);
+    }
 
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
@@ -987,6 +1187,20 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     try stdout.print("webtest: {d}\n", .{webtest_count});
 }
 
+fn writePlanToPath(allocator: std.mem.Allocator, path: []const u8, format: []const u8, plan: *PlanSummary) !void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    if (std.ascii.eqlIgnoreCase(format, "text")) {
+        try writePlanText(writer, plan);
+    } else if (std.ascii.eqlIgnoreCase(format, "shell")) {
+        try writePlanShell(writer, plan);
+    } else {
+        try writePlanJson(allocator, writer, plan);
+    }
+    try writeFileAtomic(path, out.items);
+}
+
 fn runStub(command_name: []const u8, query: QueryOptions) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("node-tool: {s} is planned but not implemented yet\n", .{command_name});
@@ -1012,6 +1226,14 @@ fn resolveStatFormat(raw: ?[]const u8) !OutputFormat {
     const format = raw orelse "text";
     if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
     if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
+    return error.InvalidArguments;
+}
+
+fn resolveExportSourcesFormat(raw: ?[]const u8) !OutputFormat {
+    const format = raw orelse "text";
+    if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
+    if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(format, "shell")) return .shell;
     return error.InvalidArguments;
 }
 
@@ -1700,6 +1922,16 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_state: *const SchemaState,
         for (moved.items) |*item| item.deinit(allocator);
         moved.deinit(allocator);
     }
+    var mappings = std.ArrayList(ReconcileMapItem){};
+    errdefer {
+        for (mappings.items) |*item| item.deinit(allocator);
+        mappings.deinit(allocator);
+    }
+    var unmapped = std.ArrayList(ReconcileMapItem){};
+    errdefer {
+        for (unmapped.items) |*item| item.deinit(allocator);
+        unmapped.deinit(allocator);
+    }
 
     for (new_nodes) |node| {
         if (findNodeIndexById(old_nodes, node.id)) |idx| {
@@ -1728,12 +1960,15 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_state: *const SchemaState,
     const final_order = try joinNodeOrderCsvAlloc(allocator, new_nodes);
     const old_order = try joinNodeOrderCsvAlloc(allocator, old_nodes);
     defer allocator.free(old_order);
+    try buildReferenceMappings(allocator, old_nodes, new_nodes, &mappings, &unmapped);
 
     return .{
         .added = added,
         .updated = updated,
         .removed = removed,
         .moved = moved,
+        .mappings = mappings,
+        .unmapped = unmapped,
         .current_before_id = try allocator.dupe(u8, old_state.current_id),
         .current_before_identity = try allocator.dupe(u8, old_state.current_identity),
         .current_after_id = try allocator.dupe(u8, new_state.current_id),
@@ -1780,6 +2015,92 @@ fn makePlanItemWithChanges(allocator: std.mem.Allocator, old_node: NodeRecord, n
     return item;
 }
 
+fn makeReconcileMapItem(allocator: std.mem.Allocator, reason: []const u8, old_node: NodeRecord, new_node: ?NodeRecord) !ReconcileMapItem {
+    return .{
+        .match_reason = try allocator.dupe(u8, reason),
+        .old_id = try allocator.dupe(u8, old_node.id),
+        .old_identity = try allocator.dupe(u8, old_node.identity),
+        .old_name = try allocator.dupe(u8, old_node.name),
+        .new_id = try allocator.dupe(u8, if (new_node) |node| node.id else ""),
+        .new_identity = try allocator.dupe(u8, if (new_node) |node| node.identity else ""),
+        .new_name = try allocator.dupe(u8, if (new_node) |node| node.name else ""),
+    };
+}
+
+fn findFirstUnusedByIdentity(nodes: []const NodeRecord, used: []bool, identity: []const u8) ?usize {
+    if (identity.len == 0) return null;
+    for (nodes, 0..) |node, idx| {
+        if (used[idx]) continue;
+        if (std.mem.eql(u8, node.identity, identity)) return idx;
+    }
+    return null;
+}
+
+fn findUniqueUnusedByPrimary(nodes: []const NodeRecord, used: []bool, primary: []const u8) ?usize {
+    if (primary.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (used[idx]) continue;
+        if (!std.mem.eql(u8, node.identity_primary, primary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn findUniqueUnusedByScopeSecondary(nodes: []const NodeRecord, used: []bool, source_scope: []const u8, secondary: []const u8) ?usize {
+    if (source_scope.len == 0 or secondary.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (used[idx]) continue;
+        if (!std.mem.eql(u8, node.source_scope, source_scope)) continue;
+        if (!std.mem.eql(u8, node.identity_secondary, secondary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn buildReferenceMappings(allocator: std.mem.Allocator, old_nodes: []const NodeRecord, new_nodes: []const NodeRecord, mappings: *std.ArrayList(ReconcileMapItem), unmapped: *std.ArrayList(ReconcileMapItem)) !void {
+    var old_used = try allocator.alloc(bool, old_nodes.len);
+    defer allocator.free(old_used);
+    @memset(old_used, false);
+    var new_used = try allocator.alloc(bool, new_nodes.len);
+    defer allocator.free(new_used);
+    @memset(new_used, false);
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (findFirstUnusedByIdentity(new_nodes, new_used, old_node.identity)) |new_idx| {
+            try mappings.append(allocator, try makeReconcileMapItem(allocator, "identity", old_node, new_nodes[new_idx]));
+            old_used[old_idx] = true;
+            new_used[new_idx] = true;
+        }
+    }
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (old_used[old_idx]) continue;
+        if (findUniqueUnusedByPrimary(new_nodes, new_used, old_node.identity_primary)) |new_idx| {
+            try mappings.append(allocator, try makeReconcileMapItem(allocator, "primary", old_node, new_nodes[new_idx]));
+            old_used[old_idx] = true;
+            new_used[new_idx] = true;
+        }
+    }
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (old_used[old_idx]) continue;
+        if (findUniqueUnusedByScopeSecondary(new_nodes, new_used, old_node.source_scope, old_node.identity_secondary)) |new_idx| {
+            try mappings.append(allocator, try makeReconcileMapItem(allocator, "scope_secondary", old_node, new_nodes[new_idx]));
+            old_used[old_idx] = true;
+            new_used[new_idx] = true;
+        }
+    }
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (old_used[old_idx]) continue;
+        try unmapped.append(allocator, try makeReconcileMapItem(allocator, "missing", old_node, null));
+    }
+}
+
 fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
     try writer.print("added: {d}\n", .{plan.added.items.len});
     for (plan.added.items) |item| try writer.print("  + {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
@@ -1794,6 +2115,10 @@ fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
     for (plan.removed.items) |item| try writer.print("  - {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("moved: {d}\n", .{plan.moved.items.len});
     for (plan.moved.items) |item| try writer.print("  > {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    try writer.print("mappings: {d}\n", .{plan.mappings.items.len});
+    for (plan.mappings.items) |item| try writer.print("  = {s}\t{s}\t{s}\t{s}\t{s}\n", .{ item.match_reason, item.old_id, item.old_name, item.new_id, item.new_name });
+    try writer.print("unmapped: {d}\n", .{plan.unmapped.items.len});
+    for (plan.unmapped.items) |item| try writer.print("  ! {s}\t{s}\t{s}\n", .{ item.old_id, item.old_identity, item.old_name });
     try writer.print("final_count: {d}\n", .{plan.final_count});
     try writer.print("order_changed: {s}\n", .{if (plan.order_changed) "1" else "0"});
     try writer.print("current_before: {s} {s}\n", .{ plan.current_before_id, plan.current_before_identity });
@@ -1831,6 +2156,16 @@ fn writePlanJson(allocator: std.mem.Allocator, writer: anytype, plan: *PlanSumma
         const rendered = try renderPlanItemJsonAlloc(allocator, item);
         defer allocator.free(rendered);
         try writer.writeAll(rendered);
+    }
+    try writer.writeAll("],\"mappings\":[");
+    for (plan.mappings.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        try writeReconcileMapItemJson(writer, item);
+    }
+    try writer.writeAll("],\"unmapped\":[");
+    for (plan.unmapped.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        try writeReconcileMapItemJson(writer, item);
     }
     try writer.print("],\"final_count\":{d},\"order_changed\":{s},\"current_before\":{{\"id\":", .{
         plan.final_count,
@@ -1880,6 +2215,24 @@ fn writePlanShell(writer: anytype, plan: *PlanSummary) !void {
     for (plan.moved.items) |item| {
         try writer.print("move\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
     }
+    for (plan.mappings.items) |item| {
+        try writer.print("map\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            item.match_reason,
+            item.old_id,
+            item.old_identity,
+            item.new_id,
+            item.new_identity,
+            item.old_name,
+            item.new_name,
+        });
+    }
+    for (plan.unmapped.items) |item| {
+        try writer.print("unmapped\t{s}\t{s}\t{s}\n", .{
+            item.old_id,
+            item.old_identity,
+            item.old_name,
+        });
+    }
     try writer.print("current\t{s}\t{s}\t{s}\t{s}\n", .{
         plan.current_before_id,
         plan.current_before_identity,
@@ -1893,6 +2246,24 @@ fn writePlanShell(writer: anytype, plan: *PlanSummary) !void {
         plan.failover_after_identity,
     });
     try writer.print("final_order\t{s}\n", .{plan.final_order});
+}
+
+fn writeReconcileMapItemJson(writer: anytype, item: ReconcileMapItem) !void {
+    try writer.writeAll("{\"reason\":");
+    try writeJsonString(writer, item.match_reason);
+    try writer.writeAll(",\"old_id\":");
+    try writeJsonString(writer, item.old_id);
+    try writer.writeAll(",\"old_identity\":");
+    try writeJsonString(writer, item.old_identity);
+    try writer.writeAll(",\"old_name\":");
+    try writeJsonString(writer, item.old_name);
+    try writer.writeAll(",\"new_id\":");
+    try writeJsonString(writer, item.new_id);
+    try writer.writeAll(",\"new_identity\":");
+    try writeJsonString(writer, item.new_identity);
+    try writer.writeAll(",\"new_name\":");
+    try writeJsonString(writer, item.new_name);
+    try writer.writeAll("}");
 }
 
 fn renderPlanItemJsonAlloc(allocator: std.mem.Allocator, item: PlanItem) ![]u8 {
@@ -2950,6 +3321,13 @@ fn containsAsciiCaseFold(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn containsSliceOwned(items: [][]u8, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, value)) return true;
+    }
+    return false;
+}
+
 fn isNumericNodeKey(key: []const u8) bool {
     if (!std.mem.startsWith(u8, key, "fss_node_")) return false;
     const suffix = key["fss_node_".len..];
@@ -3070,6 +3448,193 @@ fn writeStatArray(writer: anytype, items: []const StatItem) !void {
     }
 }
 
+fn normalizeGroupLabelAlloc(allocator: std.mem.Allocator, raw_group: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_group, " \t\r\n");
+    if (trimmed.len == 0) return try allocator.dupe(u8, "");
+    if (std.mem.eql(u8, trimmed, "null") or std.mem.eql(u8, trimmed, "_")) {
+        return try allocator.dupe(u8, "");
+    }
+    if (std.mem.lastIndexOfScalar(u8, trimmed, '_')) |pos| {
+        if (pos > 0) return try allocator.dupe(u8, trimmed[0..pos]);
+    }
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn sourceBucketKind(node: NodeRecord) []const u8 {
+    return if (std.mem.eql(u8, node.source, "subscribe")) "subscribe" else "user";
+}
+
+fn sourceBucketKeyAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]u8 {
+    if (!std.mem.eql(u8, node.source, "subscribe")) return try allocator.dupe(u8, "user");
+    if (node.source_tag.len > 0) return try allocator.dupe(u8, node.source_tag);
+    if (node.source_url_hash.len > 0) return try allocator.dupe(u8, node.source_url_hash);
+    if (node.airport_identity.len > 0) return try allocator.dupe(u8, node.airport_identity);
+    return try allocator.dupe(u8, "unknown");
+}
+
+fn sourceBucketLabelAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]u8 {
+    if (!std.mem.eql(u8, node.source, "subscribe")) return try allocator.dupe(u8, "");
+    const label = try normalizeGroupLabelAlloc(allocator, node.group);
+    if (label.len > 0) return label;
+    allocator.free(label);
+    if (node.airport_identity.len > 0) return try allocator.dupe(u8, node.airport_identity);
+    if (node.source_tag.len > 0) return try allocator.dupe(u8, node.source_tag);
+    return try allocator.dupe(u8, "subscribe");
+}
+
+fn findOrCreateSourceBucket(allocator: std.mem.Allocator, buckets: *std.ArrayList(SourceExportBucket), output_dir: []const u8, node: NodeRecord, next_sub_idx: *usize) !usize {
+    const source_kind = sourceBucketKind(node);
+    const bucket_key = try sourceBucketKeyAlloc(allocator, node);
+    defer allocator.free(bucket_key);
+
+    for (buckets.items, 0..) |bucket, idx| {
+        if (std.mem.eql(u8, bucket.source, source_kind) and std.mem.eql(u8, bucket.key, bucket_key)) {
+            return idx;
+        }
+    }
+
+    const label = try sourceBucketLabelAlloc(allocator, node);
+    errdefer allocator.free(label);
+    const key = try allocator.dupe(u8, bucket_key);
+    errdefer allocator.free(key);
+    const source = try allocator.dupe(u8, source_kind);
+    errdefer allocator.free(source);
+
+    const path = if (std.mem.eql(u8, source_kind, "user"))
+        try std.fmt.allocPrint(allocator, "{s}/local_0_user.txt", .{output_dir})
+    else blk: {
+        next_sub_idx.* += 1;
+        break :blk try std.fmt.allocPrint(allocator, "{s}/local_{d}_{s}.txt", .{ output_dir, next_sub_idx.*, key });
+    };
+    errdefer allocator.free(path);
+
+    try buckets.append(allocator, .{
+        .source = source,
+        .key = key,
+        .label = label,
+        .path = path,
+        .count = 0,
+        .content = std.ArrayList(u8){},
+    });
+    return buckets.items.len - 1;
+}
+
+fn writeSourceBuckets(allocator: std.mem.Allocator, buckets: *std.ArrayList(SourceExportBucket)) !void {
+    for (buckets.items) |bucket| {
+        try writeFileAtomic(bucket.path, bucket.content.items);
+    }
+    _ = allocator;
+}
+
+fn writeSourceMetaFile(allocator: std.mem.Allocator, meta_path: []const u8, buckets: []const SourceExportBucket) !void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    for (buckets) |bucket| {
+        try writer.print("{s}\t{d}\t{s}\t{s}\n", .{
+            bucket.path,
+            bucket.count,
+            bucket.key,
+            bucket.label,
+        });
+    }
+    try writeFileAtomic(meta_path, out.items);
+}
+
+fn writeSourceExportText(writer: anytype, buckets: []const SourceExportBucket, total: usize) !void {
+    try writer.print("command: export-sources\n", .{});
+    try writer.print("total: {d}\n", .{total});
+    try writer.print("files: {d}\n", .{buckets.len});
+    for (buckets) |bucket| {
+        try writer.print("item: {s}\t{s}\t{d}\t{s}\t{s}\n", .{
+            bucket.source,
+            bucket.path,
+            bucket.count,
+            bucket.key,
+            bucket.label,
+        });
+    }
+}
+
+fn writeSourceExportShell(writer: anytype, buckets: []const SourceExportBucket, total: usize) !void {
+    try writer.print("summary\t{d}\t{d}\n", .{ total, buckets.len });
+    for (buckets) |bucket| {
+        try writer.print("item\t{s}\t{s}\t{d}\t{s}\t{s}\n", .{
+            bucket.source,
+            bucket.path,
+            bucket.count,
+            bucket.key,
+            bucket.label,
+        });
+    }
+}
+
+fn writeSourceExportJson(allocator: std.mem.Allocator, writer: anytype, buckets: []const SourceExportBucket, total: usize) !void {
+    try writer.print("{{\"command\":\"export-sources\",\"total\":{d},\"files\":[", .{total});
+    for (buckets, 0..) |bucket, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        var out = std.ArrayList(u8){};
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        try w.writeAll("{\"source\":");
+        try writeJsonString(w, bucket.source);
+        try w.writeAll(",\"path\":");
+        try writeJsonString(w, bucket.path);
+        try w.print(",\"count\":{d},\"key\":", .{bucket.count});
+        try writeJsonString(w, bucket.key);
+        try w.writeAll(",\"label\":");
+        try writeJsonString(w, bucket.label);
+        try w.writeAll("}");
+        try writer.writeAll(out.items);
+    }
+    try writer.writeAll("]}\n");
+}
+
+fn writePruneExportText(writer: anytype, kept_count: usize, removed: []const SourceExportBucket) !void {
+    try writer.print("command: prune-export-sources\n", .{});
+    try writer.print("kept: {d}\n", .{kept_count});
+    try writer.print("removed: {d}\n", .{removed.len});
+    for (removed) |item| {
+        try writer.print("remove: {s}\t{s}\t{d}\t{s}\n", .{
+            item.key,
+            item.label,
+            item.count,
+            item.path,
+        });
+    }
+}
+
+fn writePruneExportShell(writer: anytype, kept_count: usize, removed: []const SourceExportBucket) !void {
+    try writer.print("summary\t{d}\t{d}\n", .{ kept_count, removed.len });
+    for (removed) |item| {
+        try writer.print("remove\t{s}\t{s}\t{d}\t{s}\n", .{
+            item.key,
+            item.label,
+            item.count,
+            item.path,
+        });
+    }
+}
+
+fn writePruneExportJson(allocator: std.mem.Allocator, writer: anytype, kept_count: usize, removed: []const SourceExportBucket) !void {
+    try writer.print("{{\"command\":\"prune-export-sources\",\"kept\":{d},\"removed\":[", .{kept_count});
+    for (removed, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        var out = std.ArrayList(u8){};
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        try w.writeAll("{\"key\":");
+        try writeJsonString(w, item.key);
+        try w.writeAll(",\"label\":");
+        try writeJsonString(w, item.label);
+        try w.print(",\"count\":{d},\"path\":", .{item.count});
+        try writeJsonString(w, item.path);
+        try w.writeAll("}");
+        try writer.writeAll(out.items);
+    }
+    try writer.writeAll("]}\n");
+}
+
 fn renderNodeViewJsonAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]u8 {
     var out = std.ArrayList(u8){};
     defer out.deinit(allocator);
@@ -3174,6 +3739,8 @@ fn printUsage(writer: anytype) !void {
         "  node-tool stat [options]\n" ++
         "  node-tool find [options]\n" ++
         "  node-tool find-duplicates [options]\n" ++
+        "  node-tool export-sources [options]\n" ++
+        "  node-tool prune-export-sources [options]\n" ++
         "  node-tool node2json [options]\n" ++
         "  node-tool json2node [options]\n" ++
         "  node-tool add-node [options]\n" ++
@@ -3193,8 +3760,10 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
         .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
+        .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
+        .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
-        .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--dry-run] [--socket path]\n"),
+        .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
@@ -3210,6 +3779,62 @@ test "parse version command" {
     const args = [_][]const u8{ "node-tool", "version" };
     const options = try parseArgs(&args);
     try std.testing.expect(options.command == .version);
+}
+
+test "parse export-sources command" {
+    const args = [_][]const u8{
+        "node-tool",
+        "export-sources",
+        "--output-dir",
+        "/tmp/fancyss_subs",
+        "--meta",
+        "/tmp/fancyss_subs/local_split_meta.tsv",
+        "--all-jsonl",
+        "/tmp/fancyss_subs/ss_nodes_spl.txt",
+    };
+    const options = try parseArgs(&args);
+    try std.testing.expect(options.command == .export_sources);
+    try std.testing.expect(std.mem.eql(u8, options.query.output_dir.?, "/tmp/fancyss_subs"));
+    try std.testing.expect(std.mem.eql(u8, options.query.meta_path.?, "/tmp/fancyss_subs/local_split_meta.tsv"));
+    try std.testing.expect(std.mem.eql(u8, options.query.all_jsonl_path.?, "/tmp/fancyss_subs/ss_nodes_spl.txt"));
+}
+
+test "parse json2node plan output args" {
+    const args = [_][]const u8{
+        "node-tool",
+        "json2node",
+        "--input",
+        "/tmp/nodes.jsonl",
+        "--mode",
+        "replace",
+        "--reuse-ids",
+        "--plan-output",
+        "/tmp/plan.tsv",
+        "--plan-format",
+        "shell",
+        "--dry-run",
+    };
+    const options = try parseArgs(&args);
+    try std.testing.expect(options.command == .json2node);
+    try std.testing.expect(std.mem.eql(u8, options.query.plan_output.?, "/tmp/plan.tsv"));
+    try std.testing.expect(std.mem.eql(u8, options.query.plan_format.?, "shell"));
+}
+
+test "parse prune export sources args" {
+    const args = [_][]const u8{
+        "node-tool",
+        "prune-export-sources",
+        "--meta",
+        "/tmp/fancyss_subs/local_split_meta.tsv",
+        "--active-source-tags",
+        "/tmp/fancyss_subs/active_source_tags.txt",
+        "--format",
+        "shell",
+    };
+    const options = try parseArgs(&args);
+    try std.testing.expect(options.command == .prune_export_sources);
+    try std.testing.expect(std.mem.eql(u8, options.query.meta_path.?, "/tmp/fancyss_subs/local_split_meta.tsv"));
+    try std.testing.expect(std.mem.eql(u8, options.query.active_source_tags_path.?, "/tmp/fancyss_subs/active_source_tags.txt"));
 }
 
 test "parse skipd list body" {
