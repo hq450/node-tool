@@ -10,11 +10,13 @@ const Command = enum {
     list,
     stat,
     find,
+    find_duplicates,
     node2json,
     json2node,
     add_node,
     delete_node,
     delete_nodes,
+    dedupe,
     warm_cache,
     reorder,
     plan,
@@ -64,6 +66,7 @@ const QueryOptions = struct {
     warm_json: bool = false,
     warm_direct_domains: bool = false,
     warm_webtest: bool = false,
+    duplicate_match: ?[]const u8 = null,
     socket_path: []const u8 = skipd_socket_path_default,
 };
 
@@ -308,12 +311,53 @@ const PlanItem = struct {
     name: []u8,
     protocol: []u8,
     identity: []u8,
+    changes: std.ArrayList(PlanFieldChange),
 
     fn deinit(self: *PlanItem, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
         allocator.free(self.protocol);
         allocator.free(self.identity);
+        for (self.changes.items) |*change| change.deinit(allocator);
+        self.changes.deinit(allocator);
+    }
+};
+
+const tracked_plan_fields = [_][]const u8{
+    "name",
+    "group",
+    "server",
+    "port",
+    "type",
+    "xray_prot",
+    "method",
+    "ss_obfs",
+    "xray_network",
+    "xray_network_security",
+    "xray_network_security_sni",
+    "xray_publickey",
+    "xray_shortid",
+    "trojan_uuid",
+    "trojan_sni",
+    "naive_server",
+    "naive_port",
+    "hy2_server",
+    "hy2_port",
+    "hy2_sni",
+    "hy2_obfs",
+    "hy2_up",
+    "hy2_dl",
+};
+
+const PlanFieldChange = struct {
+    field: []u8,
+    old_value: []u8,
+    new_value: []u8,
+
+    fn deinit(self: *PlanFieldChange, allocator: std.mem.Allocator) void {
+        allocator.free(self.field);
+        allocator.free(self.old_value);
+        allocator.free(self.new_value);
     }
 };
 
@@ -377,6 +421,37 @@ const ImportResult = enum {
     skipped,
 };
 
+const DuplicateKind = enum {
+    identity,
+    config,
+};
+
+const DuplicateItem = struct {
+    kind: DuplicateKind,
+    keep_id: []u8,
+    keep_name: []u8,
+    remove_id: []u8,
+    remove_name: []u8,
+    signature: []u8,
+
+    fn deinit(self: *DuplicateItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.keep_id);
+        allocator.free(self.keep_name);
+        allocator.free(self.remove_id);
+        allocator.free(self.remove_name);
+        allocator.free(self.signature);
+    }
+};
+
+const DuplicateSummary = struct {
+    items: std.ArrayList(DuplicateItem),
+
+    fn deinit(self: *DuplicateSummary, allocator: std.mem.Allocator) void {
+        for (self.items.items) |*item| item.deinit(allocator);
+        self.items.deinit(allocator);
+    }
+};
+
 pub fn main() void {
     run() catch |err| {
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -426,6 +501,11 @@ fn run() !void {
                 else => unreachable,
             }
         },
+        .find_duplicates => {
+            var state = try loadSchema2State(allocator, options.query.socket_path);
+            defer state.deinit(allocator);
+            try runFindDuplicates(allocator, &state, options.query);
+        },
         .json2node, .add_node, .delete_node, .delete_nodes => {
             var state = try loadSchema2State(allocator, options.query.socket_path);
             defer state.deinit(allocator);
@@ -436,6 +516,11 @@ fn run() !void {
                 .delete_nodes => try runDeleteNodes(allocator, &state, options.query),
                 else => unreachable,
             }
+        },
+        .dedupe => {
+            var state = try loadSchema2State(allocator, options.query.socket_path);
+            defer state.deinit(allocator);
+            try runDedupe(allocator, &state, options.query);
         },
         .reorder, .plan => {
             var state = try loadSchema2State(allocator, options.query.socket_path);
@@ -462,11 +547,13 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "list")) break :blk Command.list;
         if (std.mem.eql(u8, args[1], "stat")) break :blk Command.stat;
         if (std.mem.eql(u8, args[1], "find")) break :blk Command.find;
+        if (std.mem.eql(u8, args[1], "find-duplicates")) break :blk Command.find_duplicates;
         if (std.mem.eql(u8, args[1], "node2json")) break :blk Command.node2json;
         if (std.mem.eql(u8, args[1], "json2node")) break :blk Command.json2node;
         if (std.mem.eql(u8, args[1], "add-node")) break :blk Command.add_node;
         if (std.mem.eql(u8, args[1], "delete-node")) break :blk Command.delete_node;
         if (std.mem.eql(u8, args[1], "delete-nodes")) break :blk Command.delete_nodes;
+        if (std.mem.eql(u8, args[1], "dedupe")) break :blk Command.dedupe;
         if (std.mem.eql(u8, args[1], "warm-cache")) break :blk Command.warm_cache;
         if (std.mem.eql(u8, args[1], "reorder")) break :blk Command.reorder;
         if (std.mem.eql(u8, args[1], "plan")) break :blk Command.plan;
@@ -555,6 +642,10 @@ fn parseArgs(args: []const []const u8) !Options {
             query.warm_direct_domains = true;
         } else if (std.mem.eql(u8, arg, "--webtest")) {
             query.warm_webtest = true;
+        } else if (std.mem.eql(u8, arg, "--match")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.duplicate_match = args[i];
         } else if (std.mem.eql(u8, arg, "--socket")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -588,6 +679,39 @@ fn runFind(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOption
         .jsonl => try writeListJson(allocator, std.fs.File.stdout().deprecatedWriter(), nodes, true),
         else => unreachable,
     }
+}
+
+fn runFindDuplicates(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    var dupes = try findDuplicates(allocator, state.nodes, query.duplicate_match);
+    defer dupes.deinit(allocator);
+
+    const format = query.format orelse "text";
+    if (std.ascii.eqlIgnoreCase(format, "json")) {
+        try writeDuplicateJson(allocator, std.fs.File.stdout().deprecatedWriter(), &dupes);
+    } else if (std.ascii.eqlIgnoreCase(format, "shell")) {
+        try writeDuplicateShell(std.fs.File.stdout().deprecatedWriter(), &dupes);
+    } else {
+        try writeDuplicateText(std.fs.File.stdout().deprecatedWriter(), &dupes);
+    }
+}
+
+fn runDedupe(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    const old_nodes = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, old_nodes);
+
+    var dupes = try findDuplicates(allocator, state.nodes, query.duplicate_match);
+    defer dupes.deinit(allocator);
+
+    var removed: usize = 0;
+    for (dupes.items.items) |dupe| {
+        const count = try deleteByExactId(allocator, state, dupe.remove_id);
+        removed += count;
+    }
+
+    if (!query.dry_run) {
+        try writeSchema2State(allocator, query.socket_path, old_nodes, state);
+    }
+    try printMutationSummary("dedupe", 0, 0, removed, 0, state.nodes.len, query.dry_run);
 }
 
 fn runNode2Json(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOptions) !void {
@@ -1171,12 +1295,13 @@ fn writeSchema2State(allocator: std.mem.Allocator, socket_path: []const u8, old_
 }
 
 fn reconcileReferenceState(allocator: std.mem.Allocator, state: *SchemaState) !void {
-    const current_idx = if (state.current_identity.len > 0)
-        findNodeIndexByIdentity(state.nodes, state.current_identity)
-    else if (state.current_id.len > 0)
-        findNodeIndexById(state.nodes, state.current_id)
-    else
-        null;
+    var current_idx: ?usize = null;
+    if (state.current_identity.len > 0) {
+        current_idx = findNodeIndexByIdentity(state.nodes, state.current_identity);
+    }
+    if (current_idx == null and state.current_id.len > 0) {
+        current_idx = findNodeIndexById(state.nodes, state.current_id);
+    }
 
     if (state.nodes.len == 0) {
         allocator.free(state.current_id);
@@ -1194,12 +1319,13 @@ fn reconcileReferenceState(allocator: std.mem.Allocator, state: *SchemaState) !v
     try replaceOwnedString(allocator, &state.current_id, state.nodes[resolved_current].id);
     try replaceOwnedString(allocator, &state.current_identity, state.nodes[resolved_current].identity);
 
-    const failover_idx = if (state.failover_identity.len > 0)
-        findNodeIndexByIdentity(state.nodes, state.failover_identity)
-    else if (state.failover_id.len > 0)
-        findNodeIndexById(state.nodes, state.failover_id)
-    else
-        null;
+    var failover_idx: ?usize = null;
+    if (state.failover_identity.len > 0) {
+        failover_idx = findNodeIndexByIdentity(state.nodes, state.failover_identity);
+    }
+    if (failover_idx == null and state.failover_id.len > 0) {
+        failover_idx = findNodeIndexById(state.nodes, state.failover_id);
+    }
 
     if (failover_idx) |idx| {
         try replaceOwnedString(allocator, &state.failover_id, state.nodes[idx].id);
@@ -1578,7 +1704,7 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_state: *const SchemaState,
     for (new_nodes) |node| {
         if (findNodeIndexById(old_nodes, node.id)) |idx| {
             if (!std.mem.eql(u8, old_nodes[idx].raw_json, node.raw_json)) {
-                try updated.append(allocator, try makePlanItem(allocator, node));
+                try updated.append(allocator, try makePlanItemWithChanges(allocator, old_nodes[idx], node));
             }
         } else {
             try added.append(allocator, try makePlanItem(allocator, node));
@@ -1628,14 +1754,42 @@ fn makePlanItem(allocator: std.mem.Allocator, node: NodeRecord) !PlanItem {
         .name = try allocator.dupe(u8, node.name),
         .protocol = try allocator.dupe(u8, node.protocol),
         .identity = try allocator.dupe(u8, node.identity),
+        .changes = std.ArrayList(PlanFieldChange){},
     };
+}
+
+fn makePlanItemWithChanges(allocator: std.mem.Allocator, old_node: NodeRecord, new_node: NodeRecord) !PlanItem {
+    var item = try makePlanItem(allocator, new_node);
+    errdefer item.deinit(allocator);
+
+    for (tracked_plan_fields) |field| {
+        const old_value = try extractStringFieldAlloc(allocator, old_node.raw_json, field);
+        defer if (old_value) |value| allocator.free(value);
+        const new_value = try extractStringFieldAlloc(allocator, new_node.raw_json, field);
+        defer if (new_value) |value| allocator.free(value);
+
+        const lhs = if (old_value) |value| value else "";
+        const rhs = if (new_value) |value| value else "";
+        if (std.mem.eql(u8, lhs, rhs)) continue;
+        try item.changes.append(allocator, .{
+            .field = try allocator.dupe(u8, field),
+            .old_value = try allocator.dupe(u8, lhs),
+            .new_value = try allocator.dupe(u8, rhs),
+        });
+    }
+    return item;
 }
 
 fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
     try writer.print("added: {d}\n", .{plan.added.items.len});
     for (plan.added.items) |item| try writer.print("  + {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("updated: {d}\n", .{plan.updated.items.len});
-    for (plan.updated.items) |item| try writer.print("  ~ {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    for (plan.updated.items) |item| {
+        try writer.print("  ~ {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+        for (item.changes.items) |change| {
+            try writer.print("    · {s}: {s} -> {s}\n", .{ change.field, change.old_value, change.new_value });
+        }
+    }
     try writer.print("removed: {d}\n", .{plan.removed.items.len});
     for (plan.removed.items) |item| try writer.print("  - {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("moved: {d}\n", .{plan.moved.items.len});
@@ -1716,6 +1870,9 @@ fn writePlanShell(writer: anytype, plan: *PlanSummary) !void {
     }
     for (plan.updated.items) |item| {
         try writer.print("update\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
+        for (item.changes.items) |change| {
+            try writer.print("field\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, change.field, change.old_value, change.new_value });
+        }
     }
     for (plan.removed.items) |item| {
         try writer.print("remove\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
@@ -1750,8 +1907,161 @@ fn renderPlanItemJsonAlloc(allocator: std.mem.Allocator, item: PlanItem) ![]u8 {
     try writeJsonString(writer, item.name);
     try writer.writeAll(",\"identity\":");
     try writeJsonString(writer, item.identity);
+    try writer.writeAll(",\"changes\":[");
+    for (item.changes.items, 0..) |change, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"field\":");
+        try writeJsonString(writer, change.field);
+        try writer.writeAll(",\"old\":");
+        try writeJsonString(writer, change.old_value);
+        try writer.writeAll(",\"new\":");
+        try writeJsonString(writer, change.new_value);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]");
     try writer.writeAll("}");
     return try out.toOwnedSlice(allocator);
+}
+
+fn findDuplicates(allocator: std.mem.Allocator, nodes: []const NodeRecord, match_raw: ?[]const u8) !DuplicateSummary {
+    var items = std.ArrayList(DuplicateItem){};
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+
+    const do_identity = match_raw == null or std.ascii.eqlIgnoreCase(match_raw.?, "identity") or std.ascii.eqlIgnoreCase(match_raw.?, "all");
+    const do_config = match_raw == null or std.ascii.eqlIgnoreCase(match_raw.?, "config") or std.ascii.eqlIgnoreCase(match_raw.?, "all");
+    if (!do_identity and !do_config) return error.InvalidArguments;
+
+    var removed = try allocator.alloc(bool, nodes.len);
+    defer allocator.free(removed);
+    @memset(removed, false);
+
+    if (do_identity) {
+        var keep_idx: usize = 0;
+        while (keep_idx < nodes.len) : (keep_idx += 1) {
+            const keep_node = nodes[keep_idx];
+            if (removed[keep_idx]) continue;
+            if (keep_node.identity.len == 0) continue;
+            var remove_idx = keep_idx + 1;
+            while (remove_idx < nodes.len) : (remove_idx += 1) {
+                const remove_node = nodes[remove_idx];
+                if (removed[remove_idx]) continue;
+                if (!std.mem.eql(u8, keep_node.identity, remove_node.identity)) continue;
+                try items.append(allocator, try makeDuplicateItem(allocator, .identity, keep_node, remove_node, keep_node.identity));
+                removed[remove_idx] = true;
+            }
+        }
+    }
+
+    if (do_config) {
+        var keep_idx: usize = 0;
+        while (keep_idx < nodes.len) : (keep_idx += 1) {
+            const keep_node = nodes[keep_idx];
+            if (removed[keep_idx]) continue;
+            if (keep_node.identity_secondary.len == 0) continue;
+            var remove_idx = keep_idx + 1;
+            while (remove_idx < nodes.len) : (remove_idx += 1) {
+                const remove_node = nodes[remove_idx];
+                if (removed[remove_idx]) continue;
+                if (!std.mem.eql(u8, keep_node.identity_secondary, remove_node.identity_secondary)) continue;
+                try items.append(allocator, try makeDuplicateItem(allocator, .config, keep_node, remove_node, keep_node.identity_secondary));
+                removed[remove_idx] = true;
+            }
+        }
+    }
+
+    return .{ .items = items };
+}
+
+fn makeDuplicateItem(allocator: std.mem.Allocator, kind: DuplicateKind, keep_node: NodeRecord, remove_node: NodeRecord, signature: []const u8) !DuplicateItem {
+    return .{
+        .kind = kind,
+        .keep_id = try allocator.dupe(u8, keep_node.id),
+        .keep_name = try allocator.dupe(u8, keep_node.name),
+        .remove_id = try allocator.dupe(u8, remove_node.id),
+        .remove_name = try allocator.dupe(u8, remove_node.name),
+        .signature = try allocator.dupe(u8, signature),
+    };
+}
+
+fn duplicateKindLabel(kind: DuplicateKind) []const u8 {
+    return switch (kind) {
+        .identity => "identity",
+        .config => "config",
+    };
+}
+
+fn writeDuplicateText(writer: anytype, dupes: *DuplicateSummary) !void {
+    try writer.print("duplicates: {d}\n", .{dupes.items.items.len});
+    for (dupes.items.items) |item| {
+        try writer.print("- {s}\tkeep={s}:{s}\tremove={s}:{s}\tsig={s}\n", .{
+            duplicateKindLabel(item.kind),
+            item.keep_id,
+            item.keep_name,
+            item.remove_id,
+            item.remove_name,
+            item.signature,
+        });
+    }
+}
+
+fn writeDuplicateShell(writer: anytype, dupes: *DuplicateSummary) !void {
+    try writer.print("summary\t{d}\n", .{dupes.items.items.len});
+    for (dupes.items.items) |item| {
+        try writer.print("duplicate\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            duplicateKindLabel(item.kind),
+            item.keep_id,
+            item.keep_name,
+            item.remove_id,
+            item.remove_name,
+            item.signature,
+        });
+    }
+}
+
+fn writeDuplicateJson(allocator: std.mem.Allocator, writer: anytype, dupes: *DuplicateSummary) !void {
+    try writer.writeAll("{\"duplicates\":[");
+    for (dupes.items.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        var out = std.ArrayList(u8){};
+        defer out.deinit(allocator);
+        const w = out.writer(allocator);
+        try w.writeAll("{\"kind\":");
+        try writeJsonString(w, duplicateKindLabel(item.kind));
+        try w.writeAll(",\"keep_id\":");
+        try writeJsonString(w, item.keep_id);
+        try w.writeAll(",\"keep_name\":");
+        try writeJsonString(w, item.keep_name);
+        try w.writeAll(",\"remove_id\":");
+        try writeJsonString(w, item.remove_id);
+        try w.writeAll(",\"remove_name\":");
+        try writeJsonString(w, item.remove_name);
+        try w.writeAll(",\"signature\":");
+        try writeJsonString(w, item.signature);
+        try w.writeAll("}");
+        try writer.writeAll(out.items);
+    }
+    try writer.writeAll("]}\n");
+}
+
+fn deleteByExactId(allocator: std.mem.Allocator, state: *SchemaState, id: []const u8) !usize {
+    if (findNodeIndexById(state.nodes, id)) |idx| {
+        var kept = std.ArrayList(NodeRecord){};
+        errdefer kept.deinit(allocator);
+        for (state.nodes, 0..) |*node, cur_idx| {
+            if (cur_idx == idx) {
+                node.deinit(allocator);
+            } else {
+                try kept.append(allocator, node.*);
+            }
+        }
+        allocator.free(state.nodes);
+        state.nodes = try kept.toOwnedSlice(allocator);
+        return 1;
+    }
+    return 0;
 }
 
 fn warmJsonCache(allocator: std.mem.Allocator, nodes: []const NodeRecord) !usize {
@@ -2863,11 +3173,13 @@ fn printUsage(writer: anytype) !void {
         "  node-tool list [options]\n" ++
         "  node-tool stat [options]\n" ++
         "  node-tool find [options]\n" ++
+        "  node-tool find-duplicates [options]\n" ++
         "  node-tool node2json [options]\n" ++
         "  node-tool json2node [options]\n" ++
         "  node-tool add-node [options]\n" ++
         "  node-tool delete-node [options]\n" ++
         "  node-tool delete-nodes [options]\n" ++
+        "  node-tool dedupe [options]\n" ++
         "  node-tool warm-cache [options]\n" ++
         "  node-tool reorder [options]\n" ++
         "  node-tool plan [options]\n" ++
@@ -2880,11 +3192,13 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
         .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
+        .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
         .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
+        .dedupe => try writer.writeAll("Usage: node-tool dedupe [--match identity|config|all] [--dry-run] [--socket path]\n"),
         .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),

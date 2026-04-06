@@ -38,11 +38,13 @@
 node-tool list
 node-tool stat
 node-tool find
+node-tool find-duplicates
 node-tool node2json
 node-tool json2node
 node-tool add-node
 node-tool delete-node
 node-tool delete-nodes
+node-tool dedupe
 node-tool warm-cache
 node-tool reorder
 node-tool plan
@@ -54,14 +56,16 @@ node-tool version
 - `version` 可用
 - `list / stat / find / node2json` 已实现第一版只读能力
 - `json2node / add-node / delete-node` 已实现第一版写能力
-- `delete-nodes / reorder / plan` 已实现第一版能力
+- `find-duplicates / dedupe / delete-nodes / reorder / plan` 已实现第一版能力
 - 通过 Unix socket 直接访问 `skipd`，不依赖外部 `dbus` 可执行文件
 - 当前只支持 `schema2`
 - `warm-cache` 已实现 `json / env / direct-domains / webtest 节点级产物与聚合物料` 四类缓存预热
 - `json2node --reuse-ids` 已支持按 `_identity / _source_scope + _identity_secondary / _identity_primary` 复用旧节点
 - `json2node --mode replace --reuse-ids` 在输入与现网一致时不会触发无意义重写
 - `plan` 已输出 `added / updated / removed / moved / current_before / current_after / failover_before / failover_after / final_order`
+- `plan` 的 `updated` 项已输出关键字段级 `changes`
 - `plan --format shell` 已提供稳定的 `TAB` 分隔行协议，便于 shell 直接消费
+- `find-duplicates / dedupe` 已支持 `identity / config / all` 三种匹配模式
 - `add-node / json2node` 已支持重复节点自动 `skipped`，显式 `_id` 冲突直接报错
 - `webtest` 运行结果缓存后续再接
 
@@ -77,6 +81,8 @@ node-tool version
 - `add-node`
 - `delete-node`
 - `delete-nodes`
+- `find-duplicates`
+- `dedupe`
 - `reorder`
 - `plan`
 - `warm-cache`
