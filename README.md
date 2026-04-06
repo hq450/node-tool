@@ -51,15 +51,23 @@ node-tool version
 
 当前阶段：
 
-- `version` 和帮助输出可用
-- 其它命令先提供稳定 CLI 占位
-- 真正的数据读写逻辑后续分阶段实现
+- `version` 可用
+- `list / stat / find / node2json` 已实现第一版只读能力
+- 通过 Unix socket 直接访问 `skipd`，不依赖外部 `dbus` 可执行文件
+- 当前只支持 `schema2`
+- 写命令仍为占位，后续分阶段实现
 
 ## 第一阶段目标
 
-优先实现以下命令：
+当前已实现：
 
 - `node2json`
+- `list`
+- `stat`
+- `find`
+
+后续优先实现：
+
 - `json2node`
 - `add-node`
 - `delete-node`
@@ -106,4 +114,3 @@ bash ./scripts/build-release.sh
 
 - `armv5te` 使用 `UPX 4.2.4`
 - 其它目标使用 `UPX 5.0.2`
-
