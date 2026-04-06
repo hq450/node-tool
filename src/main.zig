@@ -26,6 +26,7 @@ const OutputFormat = enum {
     json,
     jsonl,
     text,
+    shell,
 };
 
 const MutationMode = enum {
@@ -370,6 +371,12 @@ const ImportHints = struct {
     }
 };
 
+const ImportResult = enum {
+    added,
+    updated,
+    skipped,
+};
+
 pub fn main() void {
     run() catch |err| {
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -383,6 +390,9 @@ pub fn main() void {
             },
             error.UnsupportedSchema => {
                 stderr.print("error: node-tool currently only supports schema2 storage\n", .{}) catch {};
+            },
+            error.NodeIdConflict => {
+                stderr.print("error: explicit _id conflicts with an existing node; use --reuse-ids if you intend to update it\n", .{}) catch {};
             },
             else => {
                 stderr.print("error: {s}\n", .{@errorName(err)}) catch {};
@@ -677,13 +687,19 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
 
     var added: usize = 0;
     var updated: usize = 0;
+    var skipped: usize = 0;
     if (mode == .replace) {
         freeNodeSlice(allocator, state.nodes);
         state.nodes = try allocator.alloc(NodeRecord, 0);
     }
 
     for (docs) |raw_doc| {
-        try importNodeDocument(allocator, state, raw_doc, query, "tail", if (mode == .replace) old_nodes else null, &added, &updated);
+        const result = try importNodeDocument(allocator, state, raw_doc, query, "tail", if (mode == .replace) old_nodes else null);
+        switch (result) {
+            .added => added += 1,
+            .updated => updated += 1,
+            .skipped => skipped += 1,
+        }
     }
 
     var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
@@ -692,7 +708,7 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
-    try printMutationSummary("json2node", plan.added.items.len, plan.updated.items.len, plan.removed.items.len, state.nodes.len, query.dry_run);
+    try printMutationSummary("json2node", plan.added.items.len, plan.updated.items.len, plan.removed.items.len, skipped, state.nodes.len, query.dry_run);
 }
 
 fn runAddNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -705,15 +721,21 @@ fn runAddNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOpt
     const old_nodes = try cloneNodeSlice(allocator, state.nodes);
     defer freeNodeSlice(allocator, old_nodes);
 
+    const position = query.position orelse "tail";
+    var skipped: usize = 0;
     var added: usize = 0;
     var updated: usize = 0;
-    const position = query.position orelse "tail";
-    try importNodeDocument(allocator, state, docs[0], query, position, null, &added, &updated);
+    const result = try importNodeDocument(allocator, state, docs[0], query, position, null);
+    switch (result) {
+        .added => added += 1,
+        .updated => updated += 1,
+        .skipped => skipped += 1,
+    }
 
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
-    try printMutationSummary("add-node", added, updated, 0, state.nodes.len, query.dry_run);
+    try printMutationSummary("add-node", added, updated, 0, skipped, state.nodes.len, query.dry_run);
 }
 
 fn runDeleteNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -724,7 +746,7 @@ fn runDeleteNode(allocator: std.mem.Allocator, state: *SchemaState, query: Query
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
-    try printMutationSummary("delete-node", 0, 0, removed, state.nodes.len, query.dry_run);
+    try printMutationSummary("delete-node", 0, 0, removed, 0, state.nodes.len, query.dry_run);
 }
 
 fn runDeleteNodes(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -735,7 +757,7 @@ fn runDeleteNodes(allocator: std.mem.Allocator, state: *SchemaState, query: Quer
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
-    try printMutationSummary("delete-nodes", 0, 0, removed, state.nodes.len, query.dry_run);
+    try printMutationSummary("delete-nodes", 0, 0, removed, 0, state.nodes.len, query.dry_run);
 }
 
 fn runReorder(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -786,7 +808,12 @@ fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOption
         draft.nodes = try allocator.alloc(NodeRecord, 0);
     }
     for (docs) |raw_doc| {
-        try importNodeDocument(allocator, &draft, raw_doc, query, "tail", if (mode == .replace) old_nodes else null, &added, &updated);
+        const result = try importNodeDocument(allocator, &draft, raw_doc, query, "tail", if (mode == .replace) old_nodes else null);
+        switch (result) {
+            .added => added += 1,
+            .updated => updated += 1,
+            .skipped => {},
+        }
     }
     try reconcileReferenceState(allocator, &draft);
 
@@ -796,6 +823,8 @@ fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOption
     const format = query.format orelse "json";
     if (std.ascii.eqlIgnoreCase(format, "text")) {
         try writePlanText(std.fs.File.stdout().deprecatedWriter(), &plan);
+    } else if (std.ascii.eqlIgnoreCase(format, "shell")) {
+        try writePlanShell(std.fs.File.stdout().deprecatedWriter(), &plan);
     } else {
         try writePlanJson(allocator, std.fs.File.stdout().deprecatedWriter(), &plan);
     }
@@ -976,6 +1005,13 @@ fn findNodeIndexById(nodes: []const NodeRecord, id: []const u8) ?usize {
 fn findNodeIndexByIdentity(nodes: []const NodeRecord, identity: []const u8) ?usize {
     for (nodes, 0..) |node, idx| {
         if (std.mem.eql(u8, node.identity, identity)) return idx;
+    }
+    return null;
+}
+
+fn findNodeIndexByRawJson(nodes: []const NodeRecord, raw_json: []const u8) ?usize {
+    for (nodes, 0..) |node, idx| {
+        if (std.mem.eql(u8, node.raw_json, raw_json)) return idx;
     }
     return null;
 }
@@ -1276,7 +1312,7 @@ fn renderCompactJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value) !
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
-fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc: []const u8, query: QueryOptions, position: []const u8, reuse_pool: ?[]const NodeRecord, added: *usize, updated: *usize) !void {
+fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc: []const u8, query: QueryOptions, position: []const u8, reuse_pool: ?[]const NodeRecord) !ImportResult {
     var hints = try extractImportHints(allocator, raw_doc);
     defer hints.deinit(allocator);
 
@@ -1293,6 +1329,7 @@ fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc
     } else if (query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0 and findNodeIndexById(match_nodes, hints.preferred_id.?) == null) {
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else if (!query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0) {
+        if (findNodeIndexById(state.nodes, hints.preferred_id.? ) != null) return error.NodeIdConflict;
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else {
         assigned_id = try std.fmt.allocPrint(allocator, "{d}", .{state.next_id});
@@ -1304,17 +1341,37 @@ fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc
     const existing_node = if (existing_state_idx) |idx| &state.nodes[idx] else if (existing_idx) |idx| &match_nodes[idx] else null;
     const normalized = try normalizeNodeJsonForWriteAlloc(allocator, raw_doc, assigned_id, query.source, existing_node);
     defer allocator.free(normalized);
-    const new_record = try parseNodeRecordFromRawJson(allocator, normalized);
+    var new_record = try parseNodeRecordFromRawJson(allocator, normalized);
+
+    if (existing_state_idx) |idx| {
+        if (std.mem.eql(u8, state.nodes[idx].raw_json, new_record.raw_json)) {
+            new_record.deinit(allocator);
+            return .skipped;
+        }
+    } else {
+        if (findNodeIndexByIdentity(state.nodes, new_record.identity)) |identity_idx| {
+            if (query.reuse_ids and !std.mem.eql(u8, state.nodes[identity_idx].raw_json, new_record.raw_json)) {
+                state.nodes[identity_idx].deinit(allocator);
+                state.nodes[identity_idx] = new_record;
+                return .updated;
+            }
+            new_record.deinit(allocator);
+            return .skipped;
+        }
+        if (findNodeIndexByRawJson(state.nodes, new_record.raw_json)) |_| {
+            new_record.deinit(allocator);
+            return .skipped;
+        }
+    }
 
     if (existing_state_idx) |idx| {
         state.nodes[idx].deinit(allocator);
         state.nodes[idx] = new_record;
-        updated.* += 1;
-        return;
+        return .updated;
     }
 
     try insertNodeAtPosition(allocator, &state.nodes, new_record, position);
-    added.* += 1;
+    return .added;
 }
 
 fn deleteMatchingNodes(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions, single_only: bool) !usize {
@@ -1379,13 +1436,14 @@ fn insertNodeAtPosition(allocator: std.mem.Allocator, nodes: *[]NodeRecord, node
     nodes.* = try list.toOwnedSlice(allocator);
 }
 
-fn printMutationSummary(command_name: []const u8, added: usize, updated: usize, removed: usize, final_count: usize, dry_run: bool) !void {
+fn printMutationSummary(command_name: []const u8, added: usize, updated: usize, removed: usize, skipped: usize, final_count: usize, dry_run: bool) !void {
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("command: {s}\n", .{command_name});
     try stdout.print("dry_run: {s}\n", .{if (dry_run) "1" else "0"});
     try stdout.print("added: {d}\n", .{added});
     try stdout.print("updated: {d}\n", .{updated});
     try stdout.print("removed: {d}\n", .{removed});
+    try stdout.print("skipped: {d}\n", .{skipped});
     try stdout.print("final_count: {d}\n", .{final_count});
 }
 
@@ -1609,6 +1667,42 @@ fn writePlanJson(allocator: std.mem.Allocator, writer: anytype, plan: *PlanSumma
     try writer.writeAll("},\"final_order\":");
     try writeJsonString(writer, plan.final_order);
     try writer.writeAll("}\n");
+}
+
+fn writePlanShell(writer: anytype, plan: *PlanSummary) !void {
+    try writer.print("summary\t{d}\t{d}\t{d}\t{d}\t{d}\t{s}\n", .{
+        plan.added.items.len,
+        plan.updated.items.len,
+        plan.removed.items.len,
+        plan.moved.items.len,
+        plan.final_count,
+        if (plan.order_changed) "1" else "0",
+    });
+    for (plan.added.items) |item| {
+        try writer.print("add\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
+    }
+    for (plan.updated.items) |item| {
+        try writer.print("update\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
+    }
+    for (plan.removed.items) |item| {
+        try writer.print("remove\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
+    }
+    for (plan.moved.items) |item| {
+        try writer.print("move\t{s}\t{s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.identity, item.name });
+    }
+    try writer.print("current\t{s}\t{s}\t{s}\t{s}\n", .{
+        plan.current_before_id,
+        plan.current_before_identity,
+        plan.current_after_id,
+        plan.current_after_identity,
+    });
+    try writer.print("failover\t{s}\t{s}\t{s}\t{s}\n", .{
+        plan.failover_before_id,
+        plan.failover_before_identity,
+        plan.failover_after_id,
+        plan.failover_after_identity,
+    });
+    try writer.print("final_order\t{s}\n", .{plan.final_order});
 }
 
 fn renderPlanItemJsonAlloc(allocator: std.mem.Allocator, item: PlanItem) ![]u8 {
@@ -2754,7 +2848,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
         .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
-        .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text] [--socket path]\n"),
+        .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
     }
 }
