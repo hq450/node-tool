@@ -319,6 +319,7 @@ const PlanSummary = struct {
     added: std.ArrayList(PlanItem),
     updated: std.ArrayList(PlanItem),
     removed: std.ArrayList(PlanItem),
+    moved: std.ArrayList(PlanItem),
     final_order: []u8,
     final_count: usize,
     order_changed: bool,
@@ -330,7 +331,25 @@ const PlanSummary = struct {
         self.updated.deinit(allocator);
         for (self.removed.items) |*item| item.deinit(allocator);
         self.removed.deinit(allocator);
+        for (self.moved.items) |*item| item.deinit(allocator);
+        self.moved.deinit(allocator);
         allocator.free(self.final_order);
+    }
+};
+
+const ImportHints = struct {
+    preferred_id: ?[]u8 = null,
+    identity: ?[]u8 = null,
+    identity_primary: ?[]u8 = null,
+    identity_secondary: ?[]u8 = null,
+    source_scope: ?[]u8 = null,
+
+    fn deinit(self: *ImportHints, allocator: std.mem.Allocator) void {
+        if (self.preferred_id) |value| allocator.free(value);
+        if (self.identity) |value| allocator.free(value);
+        if (self.identity_primary) |value| allocator.free(value);
+        if (self.identity_secondary) |value| allocator.free(value);
+        if (self.source_scope) |value| allocator.free(value);
     }
 };
 
@@ -639,10 +658,7 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
 
     var added: usize = 0;
     var updated: usize = 0;
-    var removed: usize = 0;
-
     if (mode == .replace) {
-        removed = state.nodes.len;
         freeNodeSlice(allocator, state.nodes);
         state.nodes = try allocator.alloc(NodeRecord, 0);
     }
@@ -651,16 +667,13 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
         try importNodeDocument(allocator, state, raw_doc, query, "tail", &added, &updated);
     }
 
-    if (mode == .replace and state.nodes.len < removed) {
-        removed -= state.nodes.len;
-    } else if (mode == .replace) {
-        removed = old_nodes.len - state.nodes.len + added + updated;
-    }
+    var plan = try buildPlanSummary(allocator, old_nodes, state.nodes);
+    defer plan.deinit(allocator);
 
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
-    try printMutationSummary("json2node", added, updated, removed, state.nodes.len, query.dry_run);
+    try printMutationSummary("json2node", plan.added.items.len, plan.updated.items.len, plan.removed.items.len, state.nodes.len, query.dry_run);
 }
 
 fn runAddNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -938,6 +951,45 @@ fn findNodeIndexByIdentity(nodes: []const NodeRecord, identity: []const u8) ?usi
     return null;
 }
 
+fn findUniqueNodeIndexByPrimary(nodes: []const NodeRecord, primary: []const u8) ?usize {
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (!std.mem.eql(u8, node.identity_primary, primary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn findUniqueNodeIndexByScopeSecondary(nodes: []const NodeRecord, source_scope: []const u8, secondary: []const u8) ?usize {
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (!std.mem.eql(u8, node.source_scope, source_scope)) continue;
+        if (!std.mem.eql(u8, node.identity_secondary, secondary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn resolveReusableNodeIndex(nodes: []const NodeRecord, hints: ImportHints) ?usize {
+    if (hints.preferred_id) |value| {
+        if (findNodeIndexById(nodes, value)) |idx| return idx;
+    }
+    if (hints.identity) |value| {
+        if (findNodeIndexByIdentity(nodes, value)) |idx| return idx;
+    }
+    if (hints.source_scope) |scope| {
+        if (hints.identity_secondary) |secondary| {
+            if (findUniqueNodeIndexByScopeSecondary(nodes, scope, secondary)) |idx| return idx;
+        }
+    }
+    if (hints.identity_primary) |primary| {
+        if (findUniqueNodeIndexByPrimary(nodes, primary)) |idx| return idx;
+    }
+    return null;
+}
+
 fn readStreamCompatAlloc(allocator: std.mem.Allocator, file: std.fs.File, max_bytes: usize) ![]u8 {
     var list = std.ArrayList(u8){};
     defer list.deinit(allocator);
@@ -1196,15 +1248,22 @@ fn renderCompactJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value) !
 }
 
 fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc: []const u8, query: QueryOptions, position: []const u8, added: *usize, updated: *usize) !void {
-    const preferred_id = try extractStringFieldAlloc(allocator, raw_doc, "_id");
-    defer if (preferred_id) |value| allocator.free(value);
+    var hints = try extractImportHints(allocator, raw_doc);
+    defer hints.deinit(allocator);
 
     var existing_idx: ?usize = null;
     var assigned_id: []u8 = undefined;
 
-    if (query.reuse_ids and preferred_id != null and preferred_id.?.len > 0) {
-        existing_idx = findNodeIndexById(state.nodes, preferred_id.?);
-        assigned_id = try allocator.dupe(u8, preferred_id.?);
+    if (query.reuse_ids) {
+        existing_idx = resolveReusableNodeIndex(state.nodes, hints);
+    }
+
+    if (existing_idx) |idx| {
+        assigned_id = try allocator.dupe(u8, state.nodes[idx].id);
+    } else if (query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0 and findNodeIndexById(state.nodes, hints.preferred_id.?) == null) {
+        assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
+    } else if (!query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0) {
+        assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else {
         assigned_id = try std.fmt.allocPrint(allocator, "{d}", .{state.next_id});
         state.next_id += 1;
@@ -1387,8 +1446,11 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord,
     errdefer {
         for (removed.items) |*item| item.deinit(allocator);
         removed.deinit(allocator);
-        for (added.items) |*item| item.deinit(allocator);
-        added.deinit(allocator);
+    }
+    var moved = std.ArrayList(PlanItem){};
+    errdefer {
+        for (moved.items) |*item| item.deinit(allocator);
+        moved.deinit(allocator);
     }
 
     for (new_nodes) |node| {
@@ -1407,6 +1469,14 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord,
         }
     }
 
+    for (new_nodes, 0..) |node, new_idx| {
+        if (findNodeIndexById(old_nodes, node.id)) |old_idx| {
+            if (old_idx != new_idx) {
+                try moved.append(allocator, try makePlanItem(allocator, node));
+            }
+        }
+    }
+
     const final_order = try joinNodeOrderCsvAlloc(allocator, new_nodes);
     const old_order = try joinNodeOrderCsvAlloc(allocator, old_nodes);
     defer allocator.free(old_order);
@@ -1415,6 +1485,7 @@ fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord,
         .added = added,
         .updated = updated,
         .removed = removed,
+        .moved = moved,
         .final_order = final_order,
         .final_count = new_nodes.len,
         .order_changed = !std.mem.eql(u8, old_order, final_order),
@@ -1437,6 +1508,8 @@ fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
     for (plan.updated.items) |item| try writer.print("  ~ {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("removed: {d}\n", .{plan.removed.items.len});
     for (plan.removed.items) |item| try writer.print("  - {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    try writer.print("moved: {d}\n", .{plan.moved.items.len});
+    for (plan.moved.items) |item| try writer.print("  > {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
     try writer.print("final_count: {d}\n", .{plan.final_count});
     try writer.print("order_changed: {s}\n", .{if (plan.order_changed) "1" else "0"});
     try writer.print("final_order: {s}\n", .{plan.final_order});
@@ -1459,6 +1532,13 @@ fn writePlanJson(allocator: std.mem.Allocator, writer: anytype, plan: *PlanSumma
     }
     try writer.writeAll("],\"removed\":[");
     for (plan.removed.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        const rendered = try renderPlanItemJsonAlloc(allocator, item);
+        defer allocator.free(rendered);
+        try writer.writeAll(rendered);
+    }
+    try writer.writeAll("],\"moved\":[");
+    for (plan.moved.items, 0..) |item, idx| {
         if (idx > 0) try writer.writeAll(",");
         const rendered = try renderPlanItemJsonAlloc(allocator, item);
         defer allocator.free(rendered);
@@ -2030,6 +2110,16 @@ fn extractStringFieldAlloc(allocator: std.mem.Allocator, raw_json: []const u8, k
         .string => try allocator.dupe(u8, value.string),
         .integer => try std.fmt.allocPrint(allocator, "{d}", .{value.integer}),
         else => null,
+    };
+}
+
+fn extractImportHints(allocator: std.mem.Allocator, raw_json: []const u8) !ImportHints {
+    return .{
+        .preferred_id = try extractStringFieldAlloc(allocator, raw_json, "_id"),
+        .identity = try extractStringFieldAlloc(allocator, raw_json, "_identity"),
+        .identity_primary = try extractStringFieldAlloc(allocator, raw_json, "_identity_primary"),
+        .identity_secondary = try extractStringFieldAlloc(allocator, raw_json, "_identity_secondary"),
+        .source_scope = try extractStringFieldAlloc(allocator, raw_json, "_source_scope"),
     };
 }
 
