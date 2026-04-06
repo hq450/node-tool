@@ -62,6 +62,7 @@ const QueryOptions = struct {
     warm_env: bool = false,
     warm_json: bool = false,
     warm_direct_domains: bool = false,
+    warm_webtest: bool = false,
     socket_path: []const u8 = skipd_socket_path_default,
 };
 
@@ -542,6 +543,8 @@ fn parseArgs(args: []const []const u8) !Options {
             query.warm_json = true;
         } else if (std.mem.eql(u8, arg, "--direct-domains")) {
             query.warm_direct_domains = true;
+        } else if (std.mem.eql(u8, arg, "--webtest")) {
+            query.warm_webtest = true;
         } else if (std.mem.eql(u8, arg, "--socket")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -803,23 +806,28 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     defer freeNodeSlice(allocator, targets);
     try filterNodeSliceInPlace(allocator, &targets, query);
 
-    const do_env = query.warm_env or (!query.warm_json and !query.warm_direct_domains);
-    const do_json = query.warm_json or (!query.warm_env and !query.warm_direct_domains);
-    const do_direct = query.warm_direct_domains or (!query.warm_env and !query.warm_json);
+    const no_specific = !query.warm_env and !query.warm_json and !query.warm_direct_domains and !query.warm_webtest;
+    const do_env = query.warm_env or no_specific;
+    const do_json = query.warm_json or no_specific;
+    const do_direct = query.warm_direct_domains or no_specific;
+    const do_webtest = query.warm_webtest or no_specific;
 
     var json_count: usize = 0;
     var env_count: usize = 0;
     var direct_count: usize = 0;
+    var webtest_count: usize = 0;
 
     if (do_json) json_count = try warmJsonCache(allocator, targets);
     if (do_env) env_count = try warmEnvCache(allocator, targets);
     if (do_direct) direct_count = try warmDirectDomainsCache(allocator, state.nodes);
+    if (do_webtest) webtest_count = try warmWebtestArtifacts(allocator, query.socket_path, targets);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("command: warm-cache\n", .{});
     try stdout.print("json: {d}\n", .{json_count});
     try stdout.print("env: {d}\n", .{env_count});
     try stdout.print("direct_domains: {d}\n", .{direct_count});
+    try stdout.print("webtest: {d}\n", .{webtest_count});
 }
 
 fn runStub(command_name: []const u8, query: QueryOptions) !void {
@@ -1843,6 +1851,179 @@ fn containsSlice(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, nodes: []const NodeRecord) !usize {
+    const cache_dir = "/koolshare/configs/fancyss/webtest_cache";
+    const node_dir = "/koolshare/configs/fancyss/webtest_cache/nodes";
+    const meta_dir = "/koolshare/configs/fancyss/webtest_cache/meta";
+    const index_file = "/koolshare/configs/fancyss/webtest_cache/materialize_index.txt";
+    const agg_file = "/koolshare/configs/fancyss/webtest_cache/all_outbounds.json";
+    const global_meta_file = "/koolshare/configs/fancyss/webtest_cache/cache.meta";
+
+    try std.fs.cwd().makePath(cache_dir);
+    try std.fs.cwd().makePath(node_dir);
+    try std.fs.cwd().makePath(meta_dir);
+
+    var ids = std.ArrayList([]const u8){};
+    defer ids.deinit(allocator);
+    for (nodes) |node| {
+        if (!isWebtestXrayLike(node)) continue;
+        try ids.append(allocator, node.id);
+    }
+    std.mem.sort([]const u8, ids.items, {}, lessThanNumericString);
+
+    var index = std.ArrayList(u8){};
+    defer index.deinit(allocator);
+    var aggregate = std.ArrayList(u8){};
+    defer aggregate.deinit(allocator);
+    const agg_writer = aggregate.writer(allocator);
+    try agg_writer.writeAll("{\n  \"outbounds\": [\n");
+    var first_out = true;
+
+    for (ids.items) |node_id| {
+        const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node_id });
+        defer allocator.free(meta_path);
+        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node_id });
+        defer allocator.free(out_path);
+        if (!fileExists(meta_path) or !fileExists(out_path)) continue;
+
+        const start_port = try readMetaValueAlloc(allocator, meta_path, "start_port");
+        defer allocator.free(start_port);
+        if (index.items.len > 0) try index.append(allocator, '\n');
+        try index.appendSlice(allocator, node_id);
+        try index.append(allocator, '|');
+        try index.appendSlice(allocator, start_port);
+
+        const out_json = try readFileAllocCompat(allocator, out_path, max_skipd_frame);
+        defer allocator.free(out_json);
+        if (!first_out) try agg_writer.writeAll(",\n");
+        first_out = false;
+        try agg_writer.writeAll(out_json);
+    }
+    try agg_writer.writeAll("\n  ]\n}\n");
+
+    if (index.items.len > 0) {
+        try writeFileAtomic(index_file, index.items);
+        try writeFileAtomic(agg_file, aggregate.items);
+    } else {
+        std.fs.cwd().deleteFile(index_file) catch {};
+        std.fs.cwd().deleteFile(agg_file) catch {};
+    }
+
+    try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items);
+    return ids.items.len;
+}
+
+fn isWebtestXrayLike(node: NodeRecord) bool {
+    return std.mem.eql(u8, node.type_id, "0") or
+        std.mem.eql(u8, node.type_id, "3") or
+        std.mem.eql(u8, node.type_id, "4") or
+        std.mem.eql(u8, node.type_id, "5") or
+        std.mem.eql(u8, node.type_id, "8");
+}
+
+fn lessThanNumericString(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return (std.fmt.parseInt(usize, lhs, 10) catch 0) < (std.fmt.parseInt(usize, rhs, 10) catch 0);
+}
+
+fn fileExists(path: []const u8) bool {
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
+
+fn readFileAllocCompat(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    return try readStreamCompatAlloc(allocator, file, max_bytes);
+}
+
+fn readMetaValueAlloc(allocator: std.mem.Allocator, path: []const u8, key: []const u8) ![]u8 {
+    const content = try readFileAllocCompat(allocator, path, 1024 * 1024);
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        if (line.len <= key.len or line[key.len] != '=') continue;
+        return try allocator.dupe(u8, line[key.len + 1 ..]);
+    }
+    return try allocator.dupe(u8, "");
+}
+
+fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8, path: []const u8, ids: []const []const u8) !void {
+    var client = try SkipdClient.connect(socket_path);
+    defer client.deinit();
+
+    const tfo = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_tfo"));
+    defer allocator.free(tfo);
+    const server_resolver = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv"));
+    defer allocator.free(server_resolver);
+    const resolv_mode_raw = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv_mode"));
+    defer allocator.free(resolv_mode_raw);
+    const node_config_ts = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_config_ts"));
+    defer allocator.free(node_config_ts);
+
+    const ids_blob = try joinIdsWithNewlineAlloc(allocator, ids);
+    defer allocator.free(ids_blob);
+    const ids_md5 = try md5Hex32Alloc(allocator, ids_blob);
+    defer allocator.free(ids_md5);
+    const linux_ver = try linuxVerStringAlloc(allocator);
+    defer allocator.free(linux_ver);
+
+    const content = try std.fmt.allocPrint(allocator,
+        "cache_rev=1\n" ++
+            "gen_rev=20260326_6\n" ++
+            "linux_ver={s}\n" ++
+            "ss_basic_tfo={s}\n" ++
+            "server_resolv_mode={s}\n" ++
+            "server_resolver={s}\n" ++
+            "node_config_ts={s}\n" ++
+            "xray_count={d}\n" ++
+            "xray_ids_md5={s}\n" ++
+            "built_at={d}\n",
+        .{
+            linux_ver,
+            if (tfo.len > 0) tfo else "0",
+            if (std.mem.eql(u8, resolv_mode_raw, "2")) "2" else "1",
+            if (server_resolver.len > 0) server_resolver else "-1",
+            if (node_config_ts.len > 0) node_config_ts else "0",
+            ids.len,
+            ids_md5,
+            std.time.timestamp(),
+        });
+    defer allocator.free(content);
+    try writeFileAtomic(path, content);
+}
+
+fn joinIdsWithNewlineAlloc(allocator: std.mem.Allocator, ids: []const []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    for (ids, 0..) |id, idx| {
+        if (idx > 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, id);
+    }
+    if (ids.len > 0) try out.append(allocator, '\n');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn md5Hex32Alloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(input, &digest, .{});
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    for (digest) |byte| try writer.print("{x:0>2}", .{byte});
+    return try out.toOwnedSlice(allocator);
+}
+
+fn linuxVerStringAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const uts = std.posix.uname();
+    const release = std.mem.sliceTo(&uts.release, 0);
+    var parts = std.mem.splitScalar(u8, release, '.');
+    const p1 = parts.next() orelse "0";
+    const p2 = parts.next() orelse "0";
+    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ p1, p2 });
+}
+
 fn reorderNodeRecordsAlloc(allocator: std.mem.Allocator, nodes: []NodeRecord, order_csv: ?[]const u8) ![]NodeRecord {
     if (nodes.len == 0) return try allocator.alloc(NodeRecord, 0);
 
@@ -2519,7 +2700,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
-        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
+        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
