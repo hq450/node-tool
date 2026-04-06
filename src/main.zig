@@ -3121,9 +3121,11 @@ fn normalizeNodeJsonForWriteAlloc(allocator: std.mem.Allocator, raw_json: []cons
     const ts = nowMs();
     const name = try jsonGetStringAlloc(arena, obj, "name");
     const group = try jsonGetStringAlloc(arena, obj, "group");
-    var source = try jsonGetStringAlloc(arena, obj, "_source");
+    const original_source = try jsonGetStringAlloc(arena, obj, "_source");
+    var source = original_source;
     if (source_override) |override| source = override;
     if (source.len == 0) source = "user";
+    try normalizeLegacyB64Fields(arena, obj, if (source_override) |override| override else original_source);
 
     var airport_identity = try jsonGetStringAlloc(arena, obj, "_airport_identity");
     var source_scope = try jsonGetStringAlloc(arena, obj, "_source_scope");
@@ -3178,6 +3180,36 @@ fn normalizeNodeJsonForWriteAlloc(allocator: std.mem.Allocator, raw_json: []cons
     _ = obj.orderedRemove("ping");
 
     return try renderCompactJsonAlloc(allocator, root.*);
+}
+
+fn normalizeLegacyB64Fields(arena: std.mem.Allocator, obj: *std.json.ObjectMap, source_hint: []const u8) !void {
+    const b64_mode = try jsonGetStringAlloc(arena, obj, "_b64_mode");
+    const source = source_hint;
+    const should_decode = !std.mem.eql(u8, b64_mode, "raw") and (source.len == 0 or std.mem.eql(u8, source, "subscribe"));
+    if (!should_decode) return;
+
+    try maybeDecodeLegacyB64Field(arena, obj, "password", false);
+    try maybeDecodeLegacyB64Field(arena, obj, "naive_pass", false);
+    try maybeDecodeLegacyB64Field(arena, obj, "v2ray_json", true);
+    try maybeDecodeLegacyB64Field(arena, obj, "xray_json", true);
+    try maybeDecodeLegacyB64Field(arena, obj, "tuic_json", true);
+}
+
+fn maybeDecodeLegacyB64Field(arena: std.mem.Allocator, obj: *std.json.ObjectMap, key: []const u8, compact_json: bool) !void {
+    const value = obj.get(key) orelse return;
+    if (value != .string) return;
+    if (value.string.len == 0) return;
+
+    const decoded = decodeBase64SmartAlloc(arena, value.string) catch return;
+    var final_value = decoded;
+    if (compact_json) {
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, decoded, .{}) catch {
+            try obj.put(key, .{ .string = decoded });
+            return;
+        };
+        final_value = try std.json.Stringify.valueAlloc(arena, parsed.value, .{});
+    }
+    try obj.put(key, .{ .string = final_value });
 }
 
 fn splitGroupSuffix(group: []const u8) ?struct { base: []const u8, suffix: []const u8 } {
@@ -3524,6 +3556,51 @@ fn decodeBase64StandardAlloc(allocator: std.mem.Allocator, input: []const u8) ![
     errdefer allocator.free(out);
     try Decoder.decode(out, input);
     return out;
+}
+
+fn decodeBase64SmartAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const cleaned = try stripWhitespaceAlloc(allocator, input);
+    defer allocator.free(cleaned);
+    if (cleaned.len == 0) return error.InvalidBase64;
+
+    if (std.mem.indexOfAny(u8, cleaned, "-_")) |_| {
+        return decodeBase64Alloc(allocator, cleaned, true);
+    }
+    return decodeBase64Alloc(allocator, cleaned, false);
+}
+
+fn decodeBase64Alloc(allocator: std.mem.Allocator, input: []const u8, url_safe: bool) ![]u8 {
+    const padded = try padBase64Alloc(allocator, input);
+    defer allocator.free(padded);
+
+    if (url_safe) {
+        const converted = try allocator.dupe(u8, padded);
+        defer allocator.free(converted);
+        for (converted) |*ch| {
+            if (ch.* == '-') ch.* = '+';
+            if (ch.* == '_') ch.* = '/';
+        }
+        return decodeBase64StandardAlloc(allocator, converted);
+    }
+    return decodeBase64StandardAlloc(allocator, padded);
+}
+
+fn padBase64Alloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const pad_len = (4 - (input.len % 4)) % 4;
+    var out = try allocator.alloc(u8, input.len + pad_len);
+    @memcpy(out[0..input.len], input);
+    for (out[input.len..]) |*ch| ch.* = '=';
+    return out;
+}
+
+fn stripWhitespaceAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var list = std.ArrayList(u8){};
+    defer list.deinit(allocator);
+    for (input) |ch| {
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') continue;
+        try list.append(allocator, ch);
+    }
+    return try list.toOwnedSlice(allocator);
 }
 
 fn writeListTable(writer: anytype, nodes: []const NodeRecord) !void {
