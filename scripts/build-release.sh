@@ -7,6 +7,7 @@ OUT_DIR="${OUT_DIR:-$ROOT_DIR/dist}"
 LOCAL_CACHE_BASE="${LOCAL_CACHE_BASE:-$ROOT_DIR/.zig-cache/release}"
 GLOBAL_CACHE_DIR="${GLOBAL_CACHE_DIR:-$ROOT_DIR/.zig-cache/release-global}"
 WITH_UPX=1
+BUILT_FILES=()
 
 print_usage() {
     cat <<'EOF'
@@ -104,15 +105,25 @@ build_target() {
 
     if [[ "$WITH_UPX" == "1" ]]; then
         case "$name" in
-            armv5te) upx_bin="$UPX_4_2_4" ;;
-            *) upx_bin="$UPX_5_0_2" ;;
+            x86_64)
+                echo "==> skipping UPX for $name (current static binary is not packable by UPX reliably)"
+                ;;
+            armv5te)
+                upx_bin="$UPX_4_2_4"
+                ;;
+            *)
+                upx_bin="$UPX_5_0_2"
+                ;;
         esac
-        echo "==> packing $name with $(basename "$upx_bin")"
-        "$upx_bin" --lzma --ultra-brute "$output"
+        if [[ -n "$upx_bin" ]]; then
+            echo "==> packing $name with $(basename "$upx_bin")"
+            "$upx_bin" --lzma --ultra-brute "$output"
+        fi
     fi
 
     file "$output"
     stat -c '%n %s bytes' "$output"
+    BUILT_FILES+=("$(basename "$output")")
 }
 
 TARGETS=()
@@ -176,6 +187,5 @@ done
 
 (
     cd "$OUT_DIR"
-    sha256sum "node-tool-v${VERSION}-linux-"* > "SHA256SUMS-v${VERSION}"
+    sha256sum "${BUILT_FILES[@]}" > "SHA256SUMS-v${VERSION}"
 )
-
