@@ -59,6 +59,7 @@ const QueryOptions = struct {
     meta_path: ?[]const u8 = null,
     all_jsonl_path: ?[]const u8 = null,
     active_source_tags_path: ?[]const u8 = null,
+    normalized_output: ?[]const u8 = null,
     plan_output: ?[]const u8 = null,
     plan_format: ?[]const u8 = null,
     position: ?[]const u8 = null,
@@ -685,6 +686,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.active_source_tags_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--normalized-output")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.normalized_output = args[i];
         } else if (std.mem.eql(u8, arg, "--plan-output")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -1025,6 +1030,9 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
     defer plan.deinit(allocator);
 
+    if (query.normalized_output) |normalized_output| {
+        try writeRawJsonlToPath(normalized_output, state.nodes);
+    }
     if (query.plan_output) |plan_output| {
         try writePlanToPath(allocator, plan_output, query.plan_format orelse "shell", &plan);
     }
@@ -1197,6 +1205,17 @@ fn writePlanToPath(allocator: std.mem.Allocator, path: []const u8, format: []con
         try writePlanShell(writer, plan);
     } else {
         try writePlanJson(allocator, writer, plan);
+    }
+    try writeFileAtomic(path, out.items);
+}
+
+fn writeRawJsonlToPath(path: []const u8, nodes: []const NodeRecord) !void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(std.heap.c_allocator);
+    const writer = out.writer(std.heap.c_allocator);
+    for (nodes) |node| {
+        try writer.writeAll(node.raw_json);
+        try writer.writeByte('\n');
     }
     try writeFileAtomic(path, out.items);
 }
@@ -3763,7 +3782,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
         .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
-        .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
+        .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .add_node => try writer.writeAll("Usage: node-tool add-node [--input node.json | --stdin] [--position tail|head|before:<id>|after:<id>] [--source user|subscribe] [--dry-run] [--socket path]\n"),
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
@@ -3808,6 +3827,8 @@ test "parse json2node plan output args" {
         "--mode",
         "replace",
         "--reuse-ids",
+        "--normalized-output",
+        "/tmp/nodes.normalized.jsonl",
         "--plan-output",
         "/tmp/plan.tsv",
         "--plan-format",
@@ -3816,6 +3837,7 @@ test "parse json2node plan output args" {
     };
     const options = try parseArgs(&args);
     try std.testing.expect(options.command == .json2node);
+    try std.testing.expect(std.mem.eql(u8, options.query.normalized_output.?, "/tmp/nodes.normalized.jsonl"));
     try std.testing.expect(std.mem.eql(u8, options.query.plan_output.?, "/tmp/plan.tsv"));
     try std.testing.expect(std.mem.eql(u8, options.query.plan_format.?, "shell"));
 }
