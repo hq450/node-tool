@@ -1083,57 +1083,90 @@ fn writeSchema2State(allocator: std.mem.Allocator, socket_path: []const u8, old_
     var client = try SkipdClient.connect(socket_path);
     defer client.deinit();
 
+    const old_order_csv = try joinNodeOrderCsvAlloc(allocator, old_nodes);
+    defer allocator.free(old_order_csv);
     try reconcileReferenceState(allocator, state);
+    const new_order_csv = try joinNodeOrderCsvAlloc(allocator, state.nodes);
+    defer allocator.free(new_order_csv);
+
+    var node_data_changed = false;
 
     for (old_nodes) |old_node| {
         if (findNodeIndexById(state.nodes, old_node.id) == null) {
             const key = try std.fmt.allocPrint(allocator, "fss_node_{s}", .{old_node.id});
             defer allocator.free(key);
             try client.removeKey(allocator, key);
+            node_data_changed = true;
         }
     }
 
     for (state.nodes) |node| {
+        if (findNodeIndexById(old_nodes, node.id)) |idx| {
+            if (std.mem.eql(u8, old_nodes[idx].raw_json, node.raw_json)) continue;
+        }
         const key = try std.fmt.allocPrint(allocator, "fss_node_{s}", .{node.id});
         defer allocator.free(key);
         const encoded = try encodeBase64StandardAlloc(allocator, node.raw_json);
         defer allocator.free(encoded);
         try client.setValue(allocator, key, encoded);
+        node_data_changed = true;
     }
 
-    const order_csv = try joinNodeOrderCsvAlloc(allocator, state.nodes);
-    defer allocator.free(order_csv);
-    if (order_csv.len > 0) {
-        try client.setValue(allocator, "fss_node_order", order_csv);
-    } else {
-        try client.removeKey(allocator, "fss_node_order");
+    const order_changed = !std.mem.eql(u8, old_order_csv, new_order_csv);
+    if (order_changed) {
+        if (new_order_csv.len > 0) {
+            try client.setValue(allocator, "fss_node_order", new_order_csv);
+        } else {
+            try client.removeKey(allocator, "fss_node_order");
+        }
     }
 
-    const next_id_str = try std.fmt.allocPrint(allocator, "{d}", .{computeNextId(state.nodes)});
+    const old_next_id = computeNextId(old_nodes);
+    const new_next_id = computeNextId(state.nodes);
+    const next_id_str = try std.fmt.allocPrint(allocator, "{d}", .{new_next_id});
     defer allocator.free(next_id_str);
-    try client.setValue(allocator, "fss_node_next_id", next_id_str);
+    if (new_next_id != old_next_id) {
+        try client.setValue(allocator, "fss_node_next_id", next_id_str);
+    } else if (old_nodes.len == 0 and state.nodes.len > 0) {
+        try client.setValue(allocator, "fss_node_next_id", next_id_str);
+    }
+    state.next_id = new_next_id;
     try client.setValue(allocator, "fss_data_schema", "2");
 
-    const ts = nowMs();
-    const ts_str = try std.fmt.allocPrint(allocator, "{d}", .{ts});
-    defer allocator.free(ts_str);
-    try client.setValue(allocator, "fss_node_catalog_ts", ts_str);
-    try client.setValue(allocator, "fss_node_config_ts", ts_str);
-
-    if (state.current_id.len > 0) {
-        try client.setValue(allocator, "fss_node_current", state.current_id);
-        try client.setValue(allocator, "fss_node_current_identity", state.current_identity);
-    } else {
-        try client.removeKey(allocator, "fss_node_current");
-        try client.removeKey(allocator, "fss_node_current_identity");
+    if (node_data_changed or order_changed) {
+        const ts = nowMs();
+        const ts_str = try std.fmt.allocPrint(allocator, "{d}", .{ts});
+        defer allocator.free(ts_str);
+        try client.setValue(allocator, "fss_node_catalog_ts", ts_str);
+        try client.setValue(allocator, "fss_node_config_ts", ts_str);
     }
 
-    if (state.failover_id.len > 0) {
-        try client.setValue(allocator, "fss_node_failover_backup", state.failover_id);
-        try client.setValue(allocator, "fss_node_failover_identity", state.failover_identity);
-    } else {
-        try client.removeKey(allocator, "fss_node_failover_backup");
-        try client.removeKey(allocator, "fss_node_failover_identity");
+    const current_before_id = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_current"));
+    defer allocator.free(current_before_id);
+    const current_before_identity = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_current_identity"));
+    defer allocator.free(current_before_identity);
+    if (!std.mem.eql(u8, current_before_id, state.current_id) or !std.mem.eql(u8, current_before_identity, state.current_identity)) {
+        if (state.current_id.len > 0) {
+            try client.setValue(allocator, "fss_node_current", state.current_id);
+            try client.setValue(allocator, "fss_node_current_identity", state.current_identity);
+        } else {
+            try client.removeKey(allocator, "fss_node_current");
+            try client.removeKey(allocator, "fss_node_current_identity");
+        }
+    }
+
+    const failover_before_id = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_failover_backup"));
+    defer allocator.free(failover_before_id);
+    const failover_before_identity = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_failover_identity"));
+    defer allocator.free(failover_before_identity);
+    if (!std.mem.eql(u8, failover_before_id, state.failover_id) or !std.mem.eql(u8, failover_before_identity, state.failover_identity)) {
+        if (state.failover_id.len > 0) {
+            try client.setValue(allocator, "fss_node_failover_backup", state.failover_id);
+            try client.setValue(allocator, "fss_node_failover_identity", state.failover_identity);
+        } else {
+            try client.removeKey(allocator, "fss_node_failover_backup");
+            try client.removeKey(allocator, "fss_node_failover_identity");
+        }
     }
 }
 
@@ -2256,6 +2289,12 @@ fn parseNodeRecordFromDecodedOwnedJson(allocator: std.mem.Allocator, owned_json:
 }
 
 fn normalizeNodeJsonForWriteAlloc(allocator: std.mem.Allocator, raw_json: []const u8, assigned_id: []const u8, source_override: ?[]const u8, existing_node: ?*const NodeRecord) ![]u8 {
+    if (existing_node) |node| {
+        if (std.mem.eql(u8, node.id, assigned_id) and source_override == null and std.mem.eql(u8, raw_json, node.raw_json)) {
+            return try allocator.dupe(u8, node.raw_json);
+        }
+    }
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
