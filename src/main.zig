@@ -48,6 +48,7 @@ const QueryOptions = struct {
     name: ?[]const u8 = null,
     identity: ?[]const u8 = null,
     format: ?[]const u8 = null,
+    sort: ?[]const u8 = null,
     input: ?[]const u8 = null,
     position: ?[]const u8 = null,
     mode: ?[]const u8 = null,
@@ -297,6 +298,39 @@ const StatItem = struct {
     }
 };
 
+const PlanItem = struct {
+    id: []u8,
+    name: []u8,
+    protocol: []u8,
+    identity: []u8,
+
+    fn deinit(self: *PlanItem, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.protocol);
+        allocator.free(self.identity);
+    }
+};
+
+const PlanSummary = struct {
+    added: std.ArrayList(PlanItem),
+    updated: std.ArrayList(PlanItem),
+    removed: std.ArrayList(PlanItem),
+    final_order: []u8,
+    final_count: usize,
+    order_changed: bool,
+
+    fn deinit(self: *PlanSummary, allocator: std.mem.Allocator) void {
+        for (self.added.items) |*item| item.deinit(allocator);
+        self.added.deinit(allocator);
+        for (self.updated.items) |*item| item.deinit(allocator);
+        self.updated.deinit(allocator);
+        for (self.removed.items) |*item| item.deinit(allocator);
+        self.removed.deinit(allocator);
+        allocator.free(self.final_order);
+    }
+};
+
 pub fn main() void {
     run() catch |err| {
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -354,9 +388,16 @@ fn run() !void {
                 else => unreachable,
             }
         },
+        .reorder, .plan => {
+            var state = try loadSchema2State(allocator, options.query.socket_path);
+            defer state.deinit(allocator);
+            switch (options.command) {
+                .reorder => try runReorder(allocator, &state, options.query),
+                .plan => try runPlan(allocator, &state, options.query),
+                else => unreachable,
+            }
+        },
         .warm_cache => try runStub("warm-cache", options.query),
-        .reorder => try runStub("reorder", options.query),
-        .plan => try runStub("plan", options.query),
     }
 }
 
@@ -423,6 +464,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.format = args[i];
+        } else if (std.mem.eql(u8, arg, "--sort")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.sort = args[i];
         } else if (std.mem.eql(u8, arg, "--input")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -646,6 +691,68 @@ fn runDeleteNodes(allocator: std.mem.Allocator, state: *SchemaState, query: Quer
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
     }
     try printMutationSummary("delete-nodes", 0, 0, removed, state.nodes.len, query.dry_run);
+}
+
+fn runReorder(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    const old_nodes = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, old_nodes);
+
+    if (query.ids_csv) |ids_csv| {
+        try reorderByIds(allocator, &state.nodes, ids_csv);
+    } else if (query.sort) |sort_key| {
+        try reorderBySort(allocator, &state.nodes, query, sort_key);
+    } else {
+        return error.InvalidArguments;
+    }
+
+    if (!query.dry_run) {
+        try writeSchema2State(allocator, query.socket_path, old_nodes, state);
+    }
+
+    const order_csv = try joinNodeOrderCsvAlloc(allocator, state.nodes);
+    defer allocator.free(order_csv);
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: reorder\n", .{});
+    try stdout.print("dry_run: {s}\n", .{if (query.dry_run) "1" else "0"});
+    try stdout.print("final_count: {d}\n", .{state.nodes.len});
+    try stdout.print("order: {s}\n", .{order_csv});
+}
+
+fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    const input_bytes = try readInputCompatAlloc(allocator, query.input, query.stdin_input or query.input == null, max_skipd_frame);
+    defer allocator.free(input_bytes);
+
+    const old_nodes = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, old_nodes);
+    var draft = try cloneSchemaState(allocator, state.*);
+    defer draft.deinit(allocator);
+
+    const docs = try parseInputJsonDocumentsAlloc(allocator, input_bytes);
+    defer freeStringSlice(allocator, docs);
+
+    const mode = resolveMutationMode(query.mode);
+    var added: usize = 0;
+    var updated: usize = 0;
+    var removed: usize = 0;
+
+    if (mode == .replace) {
+        removed = draft.nodes.len;
+        freeNodeSlice(allocator, draft.nodes);
+        draft.nodes = try allocator.alloc(NodeRecord, 0);
+    }
+    for (docs) |raw_doc| {
+        try importNodeDocument(allocator, &draft, raw_doc, query, "tail", &added, &updated);
+    }
+
+    var plan = try buildPlanSummary(allocator, old_nodes, draft.nodes);
+    defer plan.deinit(allocator);
+
+    const format = query.format orelse "json";
+    if (std.ascii.eqlIgnoreCase(format, "text")) {
+        try writePlanText(std.fs.File.stdout().deprecatedWriter(), &plan);
+    } else {
+        try writePlanJson(allocator, std.fs.File.stdout().deprecatedWriter(), &plan);
+    }
 }
 
 fn runStub(command_name: []const u8, query: QueryOptions) !void {
@@ -972,6 +1079,17 @@ fn cloneNodeSlice(allocator: std.mem.Allocator, nodes: []const NodeRecord) ![]No
     return try out.toOwnedSlice(allocator);
 }
 
+fn cloneSchemaState(allocator: std.mem.Allocator, state: SchemaState) !SchemaState {
+    return .{
+        .nodes = try cloneNodeSlice(allocator, state.nodes),
+        .current_id = try allocator.dupe(u8, state.current_id),
+        .current_identity = try allocator.dupe(u8, state.current_identity),
+        .failover_id = try allocator.dupe(u8, state.failover_id),
+        .failover_identity = try allocator.dupe(u8, state.failover_identity),
+        .next_id = state.next_id,
+    };
+}
+
 fn freeStringSlice(allocator: std.mem.Allocator, items: [][]u8) void {
     for (items) |item| allocator.free(item);
     allocator.free(items);
@@ -1142,6 +1260,195 @@ fn printMutationSummary(command_name: []const u8, added: usize, updated: usize, 
     try stdout.print("updated: {d}\n", .{updated});
     try stdout.print("removed: {d}\n", .{removed});
     try stdout.print("final_count: {d}\n", .{final_count});
+}
+
+fn reorderByIds(allocator: std.mem.Allocator, nodes: *[]NodeRecord, ids_csv: []const u8) !void {
+    var ordered = std.ArrayList(NodeRecord){};
+    defer ordered.deinit(allocator);
+    var used = try allocator.alloc(bool, nodes.*.len);
+    defer allocator.free(used);
+    @memset(used, false);
+
+    var matched: usize = 0;
+    var it = std.mem.splitScalar(u8, ids_csv, ',');
+    while (it.next()) |raw| {
+        const id = std.mem.trim(u8, raw, " \t\r\n");
+        if (id.len == 0) continue;
+        if (findNodeIndexById(nodes.*, id)) |idx| {
+            if (used[idx]) continue;
+            try ordered.append(allocator, nodes.*[idx]);
+            used[idx] = true;
+            matched += 1;
+        }
+    }
+    if (matched == 0) return error.InvalidArguments;
+    for (nodes.*, 0..) |node, idx| {
+        if (used[idx]) continue;
+        try ordered.append(allocator, node);
+    }
+    allocator.free(nodes.*);
+    nodes.* = try ordered.toOwnedSlice(allocator);
+}
+
+fn reorderBySort(allocator: std.mem.Allocator, nodes: *[]NodeRecord, query: QueryOptions, sort_key: []const u8) !void {
+    const has_filter = query.source != null or query.source_tag != null or query.airport_identity != null or query.group != null or query.protocol != null or query.name != null or query.identity != null;
+    if (!has_filter) {
+        std.mem.sort(NodeRecord, nodes.*, SortContext{ .key = sort_key }, lessThanNodeRecord);
+        return;
+    }
+
+    var positions = std.ArrayList(usize){};
+    defer positions.deinit(allocator);
+    var selected = std.ArrayList(NodeRecord){};
+    defer selected.deinit(allocator);
+
+    for (nodes.*, 0..) |node, idx| {
+        if (!matchSource(query.source orelse "", node.source)) continue;
+        if (!matchOptionalExact(query.source_tag orelse "", node.source_tag)) continue;
+        if (!matchOptionalExact(query.airport_identity orelse "", node.airport_identity)) continue;
+        if (!matchOptionalExact(query.group orelse "", node.group)) continue;
+        if (!matchOptionalExactCaseFold(query.protocol orelse "", node.protocol)) continue;
+        if (!matchOptionalExact(query.identity orelse "", node.identity)) continue;
+        if (!matchOptionalSubstringCaseFold(query.name orelse "", node.name)) continue;
+        try positions.append(allocator, idx);
+        try selected.append(allocator, node);
+    }
+    if (selected.items.len == 0) return error.InvalidArguments;
+
+    std.mem.sort(NodeRecord, selected.items, SortContext{ .key = sort_key }, lessThanNodeRecord);
+    const out = try allocator.alloc(NodeRecord, nodes.*.len);
+    for (nodes.*, 0..) |node, idx| out[idx] = node;
+    for (positions.items, 0..) |pos, idx| out[pos] = selected.items[idx];
+    allocator.free(nodes.*);
+    nodes.* = out;
+}
+
+const SortContext = struct {
+    key: []const u8,
+};
+
+fn lessThanNodeRecord(ctx: SortContext, lhs: NodeRecord, rhs: NodeRecord) bool {
+    if (std.ascii.eqlIgnoreCase(ctx.key, "created")) return lhs.created_at < rhs.created_at;
+    if (std.ascii.eqlIgnoreCase(ctx.key, "updated")) return lhs.updated_at < rhs.updated_at;
+    if (std.ascii.eqlIgnoreCase(ctx.key, "id")) return std.fmt.parseInt(usize, lhs.id, 10) catch 0 < (std.fmt.parseInt(usize, rhs.id, 10) catch 0);
+    if (std.ascii.eqlIgnoreCase(ctx.key, "protocol")) return std.mem.order(u8, lhs.protocol, rhs.protocol) == .lt;
+    return std.ascii.orderIgnoreCase(lhs.name, rhs.name) == .lt;
+}
+
+fn buildPlanSummary(allocator: std.mem.Allocator, old_nodes: []const NodeRecord, new_nodes: []const NodeRecord) !PlanSummary {
+    var added = std.ArrayList(PlanItem){};
+    errdefer {
+        for (added.items) |*item| item.deinit(allocator);
+        added.deinit(allocator);
+    }
+    var updated = std.ArrayList(PlanItem){};
+    errdefer {
+        for (updated.items) |*item| item.deinit(allocator);
+        updated.deinit(allocator);
+    }
+    var removed = std.ArrayList(PlanItem){};
+    errdefer {
+        for (removed.items) |*item| item.deinit(allocator);
+        removed.deinit(allocator);
+        for (added.items) |*item| item.deinit(allocator);
+        added.deinit(allocator);
+    }
+
+    for (new_nodes) |node| {
+        if (findNodeIndexById(old_nodes, node.id)) |idx| {
+            if (!std.mem.eql(u8, old_nodes[idx].raw_json, node.raw_json)) {
+                try updated.append(allocator, try makePlanItem(allocator, node));
+            }
+        } else {
+            try added.append(allocator, try makePlanItem(allocator, node));
+        }
+    }
+
+    for (old_nodes) |node| {
+        if (findNodeIndexById(new_nodes, node.id) == null) {
+            try removed.append(allocator, try makePlanItem(allocator, node));
+        }
+    }
+
+    const final_order = try joinNodeOrderCsvAlloc(allocator, new_nodes);
+    const old_order = try joinNodeOrderCsvAlloc(allocator, old_nodes);
+    defer allocator.free(old_order);
+
+    return .{
+        .added = added,
+        .updated = updated,
+        .removed = removed,
+        .final_order = final_order,
+        .final_count = new_nodes.len,
+        .order_changed = !std.mem.eql(u8, old_order, final_order),
+    };
+}
+
+fn makePlanItem(allocator: std.mem.Allocator, node: NodeRecord) !PlanItem {
+    return .{
+        .id = try allocator.dupe(u8, node.id),
+        .name = try allocator.dupe(u8, node.name),
+        .protocol = try allocator.dupe(u8, node.protocol),
+        .identity = try allocator.dupe(u8, node.identity),
+    };
+}
+
+fn writePlanText(writer: anytype, plan: *PlanSummary) !void {
+    try writer.print("added: {d}\n", .{plan.added.items.len});
+    for (plan.added.items) |item| try writer.print("  + {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    try writer.print("updated: {d}\n", .{plan.updated.items.len});
+    for (plan.updated.items) |item| try writer.print("  ~ {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    try writer.print("removed: {d}\n", .{plan.removed.items.len});
+    for (plan.removed.items) |item| try writer.print("  - {s}\t{s}\t{s}\n", .{ item.id, item.protocol, item.name });
+    try writer.print("final_count: {d}\n", .{plan.final_count});
+    try writer.print("order_changed: {s}\n", .{if (plan.order_changed) "1" else "0"});
+    try writer.print("final_order: {s}\n", .{plan.final_order});
+}
+
+fn writePlanJson(allocator: std.mem.Allocator, writer: anytype, plan: *PlanSummary) !void {
+    try writer.writeAll("{\"added\":[");
+    for (plan.added.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        const rendered = try renderPlanItemJsonAlloc(allocator, item);
+        defer allocator.free(rendered);
+        try writer.writeAll(rendered);
+    }
+    try writer.writeAll("],\"updated\":[");
+    for (plan.updated.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        const rendered = try renderPlanItemJsonAlloc(allocator, item);
+        defer allocator.free(rendered);
+        try writer.writeAll(rendered);
+    }
+    try writer.writeAll("],\"removed\":[");
+    for (plan.removed.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        const rendered = try renderPlanItemJsonAlloc(allocator, item);
+        defer allocator.free(rendered);
+        try writer.writeAll(rendered);
+    }
+    try writer.print("],\"final_count\":{d},\"order_changed\":{s},\"final_order\":", .{
+        plan.final_count,
+        if (plan.order_changed) "true" else "false",
+    });
+    try writeJsonString(writer, plan.final_order);
+    try writer.writeAll("}\n");
+}
+
+fn renderPlanItemJsonAlloc(allocator: std.mem.Allocator, item: PlanItem) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeAll("{\"id\":");
+    try writeJsonString(writer, item.id);
+    try writer.writeAll(",\"protocol\":");
+    try writeJsonString(writer, item.protocol);
+    try writer.writeAll(",\"name\":");
+    try writeJsonString(writer, item.name);
+    try writer.writeAll(",\"identity\":");
+    try writeJsonString(writer, item.identity);
+    try writer.writeAll("}");
+    return try out.toOwnedSlice(allocator);
 }
 
 fn reorderNodeRecordsAlloc(allocator: std.mem.Allocator, nodes: []NodeRecord, order_csv: ?[]const u8) ![]NodeRecord {
@@ -1811,8 +2118,8 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
         .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--ids 1,2,3]\n"),
-        .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1] [--source-tag tag --sort name] [--group user --sort created]\n"),
-        .plan => try writer.writeAll("Usage: node-tool plan --input nodes.jsonl\n"),
+        .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
+        .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
     }
 }
