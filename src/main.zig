@@ -683,7 +683,7 @@ fn runJson2Node(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     }
 
     for (docs) |raw_doc| {
-        try importNodeDocument(allocator, state, raw_doc, query, "tail", &added, &updated);
+        try importNodeDocument(allocator, state, raw_doc, query, "tail", if (mode == .replace) old_nodes else null, &added, &updated);
     }
 
     var plan = try buildPlanSummary(allocator, state, old_nodes, state, state.nodes);
@@ -708,7 +708,7 @@ fn runAddNode(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOpt
     var added: usize = 0;
     var updated: usize = 0;
     const position = query.position orelse "tail";
-    try importNodeDocument(allocator, state, docs[0], query, position, &added, &updated);
+    try importNodeDocument(allocator, state, docs[0], query, position, null, &added, &updated);
 
     if (!query.dry_run) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
@@ -786,7 +786,7 @@ fn runPlan(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOption
         draft.nodes = try allocator.alloc(NodeRecord, 0);
     }
     for (docs) |raw_doc| {
-        try importNodeDocument(allocator, &draft, raw_doc, query, "tail", &added, &updated);
+        try importNodeDocument(allocator, &draft, raw_doc, query, "tail", if (mode == .replace) old_nodes else null, &added, &updated);
     }
     try reconcileReferenceState(allocator, &draft);
 
@@ -820,7 +820,11 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     if (do_json) json_count = try warmJsonCache(allocator, targets);
     if (do_env) env_count = try warmEnvCache(allocator, targets);
     if (do_direct) direct_count = try warmDirectDomainsCache(allocator, state.nodes);
-    if (do_webtest) webtest_count = try warmWebtestArtifacts(allocator, query.socket_path, targets);
+    if (do_webtest) {
+        if (!do_json) json_count = try warmJsonCache(allocator, targets);
+        if (!do_env) env_count = try warmEnvCache(allocator, targets);
+        webtest_count = try warmWebtestArtifacts(allocator, query.socket_path, targets);
+    }
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("command: warm-cache\n", .{});
@@ -1272,20 +1276,21 @@ fn renderCompactJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value) !
     return try std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
-fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc: []const u8, query: QueryOptions, position: []const u8, added: *usize, updated: *usize) !void {
+fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc: []const u8, query: QueryOptions, position: []const u8, reuse_pool: ?[]const NodeRecord, added: *usize, updated: *usize) !void {
     var hints = try extractImportHints(allocator, raw_doc);
     defer hints.deinit(allocator);
 
     var existing_idx: ?usize = null;
     var assigned_id: []u8 = undefined;
+    const match_nodes = reuse_pool orelse state.nodes;
 
     if (query.reuse_ids) {
-        existing_idx = resolveReusableNodeIndex(state.nodes, hints);
+        existing_idx = resolveReusableNodeIndex(match_nodes, hints);
     }
 
     if (existing_idx) |idx| {
-        assigned_id = try allocator.dupe(u8, state.nodes[idx].id);
-    } else if (query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0 and findNodeIndexById(state.nodes, hints.preferred_id.?) == null) {
+        assigned_id = try allocator.dupe(u8, match_nodes[idx].id);
+    } else if (query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0 and findNodeIndexById(match_nodes, hints.preferred_id.?) == null) {
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else if (!query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0) {
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
@@ -1295,12 +1300,13 @@ fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc
     }
     defer allocator.free(assigned_id);
 
-    const existing_node = if (existing_idx) |idx| &state.nodes[idx] else null;
+    const existing_state_idx = findNodeIndexById(state.nodes, assigned_id);
+    const existing_node = if (existing_state_idx) |idx| &state.nodes[idx] else if (existing_idx) |idx| &match_nodes[idx] else null;
     const normalized = try normalizeNodeJsonForWriteAlloc(allocator, raw_doc, assigned_id, query.source, existing_node);
     defer allocator.free(normalized);
     const new_record = try parseNodeRecordFromRawJson(allocator, normalized);
 
-    if (existing_idx) |idx| {
+    if (existing_state_idx) |idx| {
         state.nodes[idx].deinit(allocator);
         state.nodes[idx] = new_record;
         updated.* += 1;
@@ -1871,6 +1877,24 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
     }
     std.mem.sort([]const u8, ids.items, {}, lessThanNumericString);
 
+    if (ids.items.len == 0) {
+        std.fs.cwd().deleteFile(index_file) catch {};
+        std.fs.cwd().deleteFile(agg_file) catch {};
+        std.fs.cwd().deleteFile(global_meta_file) catch {};
+        return 0;
+    }
+
+    const ids_file = try std.fmt.allocPrint(allocator, "/tmp/node_tool_webtest_ids_{d}.txt", .{std.time.microTimestamp()});
+    defer {
+        std.fs.cwd().deleteFile(ids_file) catch {};
+        allocator.free(ids_file);
+    }
+    const ids_blob = try joinIdsWithNewlineAlloc(allocator, ids.items);
+    defer allocator.free(ids_blob);
+    try writeFileAtomic(ids_file, ids_blob);
+
+    try buildWebtestNodeArtifactsWithShell(allocator, ids_file);
+
     var index = std.ArrayList(u8){};
     defer index.deinit(allocator);
     var aggregate = std.ArrayList(u8){};
@@ -1911,6 +1935,34 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
 
     try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items);
     return ids.items.len;
+}
+
+fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []const u8) !void {
+    const script =
+        "export KSROOT=/koolshare\n" ++
+        ". /koolshare/scripts/ss_base.sh\n" ++
+        ". /koolshare/scripts/ss_webtest.sh >/dev/null 2>&1\n" ++
+        "WT_NODE_CACHE_DIR=\"$FSS_NODE_JSON_CACHE_DIR\"\n" ++
+        "WT_NODE_ENV_DIR=\"$FSS_NODE_ENV_CACHE_DIR\"\n" ++
+        "wt_webtest_cache_prepare_dirs || exit 1\n" ++
+        "wt_init_reserved_ports\n" ++
+        "wt_reset_active_node_env\n" ++
+        "WT_CACHE_START_PORT_MAP_FILE=\"\"\n" ++
+        "while IFS= read -r node_id; do\n" ++
+        "  [ -n \"$node_id\" ] || continue\n" ++
+        "  wt_webtest_cache_build_node \"$node_id\" >/dev/null 2>&1 || exit 1\n" ++
+        "done < \"$1\"\n";
+
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "sh", "-c", script, "sh", ids_file },
+        .max_output_bytes = 64 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.term != .Exited or result.term.Exited != 0) {
+        return error.ChildProcessFailed;
+    }
 }
 
 fn isWebtestXrayLike(node: NodeRecord) bool {
