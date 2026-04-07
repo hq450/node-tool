@@ -347,6 +347,20 @@ const WebtestGroupBucket = struct {
     }
 };
 
+const WebtestRuntimeConfig = struct {
+    linux_ver: []u8,
+    tfo: []u8,
+    resolv_mode: []u8,
+    resolver: []u8,
+
+    fn deinit(self: *WebtestRuntimeConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.linux_ver);
+        allocator.free(self.tfo);
+        allocator.free(self.resolv_mode);
+        allocator.free(self.resolver);
+    }
+};
+
 const PlanItem = struct {
     id: []u8,
     name: []u8,
@@ -2953,7 +2967,9 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
     const build_content = try readFileAllocCompat(allocator, build_ids_file, max_skipd_frame);
     defer allocator.free(build_content);
     if (std.mem.trim(u8, build_content, " \t\r\n").len > 0) {
-        try buildWebtestNodeArtifactsWithShell(allocator, build_ids_file);
+        var runtime_cfg = try loadWebtestRuntimeConfig(allocator, socket_path);
+        defer runtime_cfg.deinit(allocator);
+        try buildWebtestNodeArtifactsWithShell(allocator, build_ids_file, nodes, node_dir, meta_dir, runtime_cfg);
     }
 
     var index = std.ArrayList(u8){};
@@ -3080,7 +3096,32 @@ fn collectMissingWebtestIds(allocator: std.mem.Allocator, node_dir: []const u8, 
     try writeFileAtomic(out_path, out.items);
 }
 
-fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []const u8) !void {
+fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []const u8, nodes: []const NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !void {
+    const shell_ids_file = try std.fmt.allocPrint(allocator, "/tmp/node_tool_webtest_shell_ids_{d}.txt", .{std.time.microTimestamp()});
+    defer {
+        std.fs.cwd().deleteFile(shell_ids_file) catch {};
+        allocator.free(shell_ids_file);
+    }
+    var shell_ids = std.ArrayList(u8){};
+    defer shell_ids.deinit(allocator);
+
+    const ids_content = try readFileAllocCompat(allocator, ids_file, max_skipd_frame);
+    defer allocator.free(ids_content);
+    var lines = std.mem.splitScalar(u8, ids_content, '\n');
+    while (lines.next()) |raw_line| {
+        const node_id = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (node_id.len == 0) continue;
+        if (findNodeIndexById(nodes, node_id)) |idx| {
+            if (try buildWebtestNodeArtifactNative(allocator, nodes[idx], node_dir, meta_dir, runtime_cfg)) {
+                continue;
+            }
+        }
+        try shell_ids.appendSlice(allocator, node_id);
+        try shell_ids.append(allocator, '\n');
+    }
+    if (std.mem.trim(u8, shell_ids.items, " \t\r\n").len == 0) return;
+    try writeFileAtomic(shell_ids_file, shell_ids.items);
+
     const script =
         "export KSROOT=/koolshare\n" ++
         ". /koolshare/scripts/ss_base.sh\n" ++
@@ -3121,7 +3162,7 @@ fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "sh", "-c", script, "sh", ids_file },
+        .argv = &.{ "sh", "-c", script, "sh", shell_ids_file },
         .max_output_bytes = 64 * 1024,
     });
     defer allocator.free(result.stdout);
@@ -3129,6 +3170,99 @@ fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []
     if (result.term != .Exited or result.term.Exited != 0) {
         return error.ChildProcessFailed;
     }
+}
+
+fn loadWebtestRuntimeConfig(allocator: std.mem.Allocator, socket_path: []const u8) !WebtestRuntimeConfig {
+    var client = try SkipdClient.connect(socket_path);
+    defer client.deinit();
+    const tfo = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_tfo"));
+    const server_resolver = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv"));
+    defer if (server_resolver.len == 0) allocator.free(server_resolver);
+    const resolv_mode_raw = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv_mode"));
+    defer allocator.free(resolv_mode_raw);
+    const linux_ver = try linuxVerStringAlloc(allocator);
+    return .{
+        .linux_ver = linux_ver,
+        .tfo = tfo,
+        .resolv_mode = if (std.mem.eql(u8, resolv_mode_raw, "2")) try allocator.dupe(u8, "2") else try allocator.dupe(u8, "1"),
+        .resolver = if (server_resolver.len > 0) server_resolver else try allocator.dupe(u8, "-1"),
+    };
+}
+
+fn buildWebtestNodeArtifactNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !bool {
+    if (!std.mem.eql(u8, node.type_id, "0")) return false;
+    const ss_obfs = try extractStringFieldAlloc(allocator, node.raw_json, "ss_obfs");
+    defer if (ss_obfs) |value| allocator.free(value);
+    if (ss_obfs) |value| {
+        if (value.len > 0 and !std.mem.eql(u8, value, "0")) return false;
+    }
+    const method = try extractStringFieldAlloc(allocator, node.raw_json, "method");
+    defer if (method) |value| allocator.free(value);
+    const password = try extractStringFieldAlloc(allocator, node.raw_json, "password");
+    defer if (password) |value| allocator.free(value);
+    if (method == null or password == null) return false;
+
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
+    defer allocator.free(out_path);
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
+    defer allocator.free(meta_path);
+
+    const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and std.mem.eql(u8, runtime_cfg.tfo, "1");
+    const out_json = try std.fmt.allocPrint(allocator,
+        "{{\n" ++
+            "  \"tag\": \"proxy{s}\",\n" ++
+            "  \"protocol\": \"shadowsocks\",\n" ++
+            "  \"settings\": {{\n" ++
+            "    \"servers\": [{{\n" ++
+            "      \"address\": \"{s}\",\n" ++
+            "      \"port\": {s},\n" ++
+            "      \"password\": \"{s}\",\n" ++
+            "      \"method\": \"{s}\",\n" ++
+            "      \"uot\": false\n" ++
+            "    }}]\n" ++
+            "  }},\n" ++
+            "  \"streamSettings\": {{\n" ++
+            "    \"network\": \"raw\"\n" ++
+            "  }},\n" ++
+            "  \"sockopt\": {{\n" ++
+            "    \"tcpFastOpen\": {s},\n" ++
+            "    \"tcpMptcp\": false,\n" ++
+            "    \"tcpcongestion\": \"bbr\"\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{
+            node.id,
+            node.server,
+            node.port,
+            password.?,
+            method.?,
+            if (tcp_fast_open) "true" else "false",
+        });
+    defer allocator.free(out_json);
+    try writeFileAtomic(out_path, out_json);
+
+    const meta = try std.fmt.allocPrint(allocator,
+        "node_type=0\n" ++
+            "node_rev={d}\n" ++
+            "linux_ver={s}\n" ++
+            "ss_basic_tfo={s}\n" ++
+            "server_resolv_mode={s}\n" ++
+            "server_resolver={s}\n" ++
+            "has_start=0\n" ++
+            "has_stop=0\n" ++
+            "start_port=\n" ++
+            "built_at={d}\n",
+        .{
+            node.rev,
+            runtime_cfg.linux_ver,
+            runtime_cfg.tfo,
+            runtime_cfg.resolv_mode,
+            runtime_cfg.resolver,
+            std.time.timestamp(),
+        });
+    defer allocator.free(meta);
+    try writeFileAtomic(meta_path, meta);
+    return true;
 }
 
 fn isWebtestXrayLike(node: NodeRecord) bool {
