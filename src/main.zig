@@ -3090,11 +3090,34 @@ fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []
         "wt_webtest_cache_prepare_dirs || exit 1\n" ++
         "wt_init_reserved_ports\n" ++
         "wt_reset_active_node_env\n" ++
-        "WT_CACHE_START_PORT_MAP_FILE=\"\"\n" ++
+        "WT_CACHE_START_PORT_MAP_FILE=\"/tmp/node_tool_cache_start_ports.$$\"\n" ++
+        "wt_assign_webtest_cache_start_ports \"$1\" >/dev/null 2>&1 || exit 1\n" ++
+        "worker_threads=$(wt_get_cache_build_threads)\n" ++
+        "printf '%s' \"$worker_threads\" | grep -Eq '^[0-9]+$' || worker_threads=1\n" ++
+        "[ \"$worker_threads\" -gt 0 ] || worker_threads=1\n" ++
+        "worker_fifo=\"/tmp/node_tool_cache_fifo.$$\"\n" ++
+        "fail_file=\"/tmp/node_tool_cache_fail.$$\"\n" ++
+        "rm -f \"$fail_file\"\n" ++
+        "wt_open_fifo_pool \"$worker_threads\" \"$worker_fifo\"\n" ++
+        "worker_pids=\"\"\n" ++
         "while IFS= read -r node_id; do\n" ++
         "  [ -n \"$node_id\" ] || continue\n" ++
-        "  wt_webtest_cache_build_node \"$node_id\" >/dev/null 2>&1 || exit 1\n" ++
-        "done < \"$1\"\n";
+        "  read -r _ <&3\n" ++
+        "  {\n" ++
+        "    trap 'echo >&3' EXIT\n" ++
+        "    wt_webtest_cache_build_node \"$node_id\" >/dev/null 2>&1 || {\n" ++
+        "      echo \"$node_id\" >> \"$fail_file\"\n" ++
+        "      fss_clear_webtest_cache_node \"$node_id\" >/dev/null 2>&1\n" ++
+        "    }\n" ++
+        "  } &\n" ++
+        "  worker_pids=\"$worker_pids $!\"\n" ++
+        "done < \"$1\"\n" ++
+        "[ -n \"$worker_pids\" ] && wait $worker_pids\n" ++
+        "wt_close_fifo_pool\n" ++
+        "rm -f \"$WT_CACHE_START_PORT_MAP_FILE\"\n" ++
+        "WT_CACHE_START_PORT_MAP_FILE=\"\"\n" ++
+        "[ ! -s \"$fail_file\" ] || exit 1\n" ++
+        "rm -f \"$fail_file\"\n";
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
