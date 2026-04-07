@@ -56,6 +56,7 @@ const QueryOptions = struct {
     format: ?[]const u8 = null,
     sort: ?[]const u8 = null,
     input: ?[]const u8 = null,
+    ids_file: ?[]const u8 = null,
     output_dir: ?[]const u8 = null,
     meta_path: ?[]const u8 = null,
     all_jsonl_path: ?[]const u8 = null,
@@ -673,6 +674,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.input = args[i];
+        } else if (std.mem.eql(u8, arg, "--ids-file")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.ids_file = args[i];
         } else if (std.mem.eql(u8, arg, "--output-dir")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -1280,6 +1285,9 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     var targets = try cloneNodeSlice(allocator, state.nodes);
     defer freeNodeSlice(allocator, targets);
     try filterNodeSliceInPlace(allocator, &targets, query);
+    if (query.ids_file) |ids_file| {
+        try filterNodeSliceByIdsFileInPlace(allocator, &targets, ids_file);
+    }
 
     const no_specific = !query.warm_env and !query.warm_json and !query.warm_direct_domains and !query.warm_webtest;
     const do_env = query.warm_env or no_specific;
@@ -1307,6 +1315,29 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     try stdout.print("env: {d}\n", .{env_count});
     try stdout.print("direct_domains: {d}\n", .{direct_count});
     try stdout.print("webtest: {d}\n", .{webtest_count});
+}
+
+fn filterNodeSliceByIdsFileInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, ids_file: []const u8) !void {
+    const content = try readFileAllocCompat(allocator, ids_file, max_skipd_frame);
+    defer allocator.free(content);
+
+    var ids = std.ArrayList([]const u8){};
+    defer ids.deinit(allocator);
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+        try ids.append(allocator, line);
+    }
+
+    var kept = std.ArrayList(NodeRecord){};
+    errdefer kept.deinit(allocator);
+    for (nodes.*) |node| {
+        if (!containsSliceConst(ids.items, node.id)) continue;
+        try kept.append(allocator, node);
+    }
+    allocator.free(nodes.*);
+    nodes.* = try kept.toOwnedSlice(allocator);
 }
 
 fn writePlanToPath(allocator: std.mem.Allocator, path: []const u8, format: []const u8, plan: *PlanSummary) !void {
@@ -2652,7 +2683,18 @@ fn warmDirectDomainsCache(allocator: std.mem.Allocator, nodes: []const NodeRecor
 
 fn ensureCleanDir(path: []const u8) !void {
     std.fs.cwd().deleteTree(path) catch {};
-    try std.fs.cwd().makePath(path);
+    try ensureDirExistsCompat(path);
+}
+
+fn ensureDirExistsCompat(path: []const u8) !void {
+    std.fs.cwd().makePath(path) catch |err| {
+        if (std.fs.cwd().openDir(path, .{})) |opened_dir| {
+            var dir = opened_dir;
+            dir.close();
+        } else |_| {
+            return err;
+        }
+    };
 }
 
 fn replaceDirAtomic(target: []const u8, tmp_dir: []const u8, old_dir: []const u8) !void {
@@ -2806,9 +2848,9 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
     const agg_file = "/koolshare/configs/fancyss/webtest_cache/all_outbounds.json";
     const global_meta_file = "/koolshare/configs/fancyss/webtest_cache/cache.meta";
 
-    try std.fs.cwd().makePath(cache_dir);
-    try std.fs.cwd().makePath(node_dir);
-    try std.fs.cwd().makePath(meta_dir);
+    try ensureDirExistsCompat(cache_dir);
+    try ensureDirExistsCompat(node_dir);
+    try ensureDirExistsCompat(meta_dir);
 
     var ids = std.ArrayList([]const u8){};
     defer ids.deinit(allocator);
@@ -2833,8 +2875,22 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
     const ids_blob = try joinIdsWithNewlineAlloc(allocator, ids.items);
     defer allocator.free(ids_blob);
     try writeFileAtomic(ids_file, ids_blob);
+    const build_ids_file = try std.fmt.allocPrint(allocator, "/tmp/node_tool_webtest_build_ids_{d}.txt", .{std.time.microTimestamp()});
+    defer {
+        std.fs.cwd().deleteFile(build_ids_file) catch {};
+        allocator.free(build_ids_file);
+    }
+    if (try webtestGlobalMetaMatches(allocator, socket_path, global_meta_file, ids.items)) {
+        try collectMissingWebtestIds(allocator, node_dir, meta_dir, nodes, ids.items, build_ids_file);
+    } else {
+        try writeFileAtomic(build_ids_file, ids_blob);
+    }
 
-    try buildWebtestNodeArtifactsWithShell(allocator, ids_file);
+    const build_content = try readFileAllocCompat(allocator, build_ids_file, max_skipd_frame);
+    defer allocator.free(build_content);
+    if (std.mem.trim(u8, build_content, " \t\r\n").len > 0) {
+        try buildWebtestNodeArtifactsWithShell(allocator, build_ids_file);
+    }
 
     var index = std.ArrayList(u8){};
     defer index.deinit(allocator);
@@ -2876,6 +2932,88 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
 
     try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items);
     return ids.items.len;
+}
+
+fn webtestGlobalMetaMatches(allocator: std.mem.Allocator, socket_path: []const u8, path: []const u8, ids: []const []const u8) !bool {
+    if (!fileExists(path)) return false;
+
+    const cache_rev = try readMetaValueAlloc(allocator, path, "cache_rev");
+    defer allocator.free(cache_rev);
+    const gen_rev = try readMetaValueAlloc(allocator, path, "gen_rev");
+    defer allocator.free(gen_rev);
+    const linux_ver = try readMetaValueAlloc(allocator, path, "linux_ver");
+    defer allocator.free(linux_ver);
+    const cache_tfo = try readMetaValueAlloc(allocator, path, "ss_basic_tfo");
+    defer allocator.free(cache_tfo);
+    const cache_resolv_mode = try readMetaValueAlloc(allocator, path, "server_resolv_mode");
+    defer allocator.free(cache_resolv_mode);
+    const cache_resolver = try readMetaValueAlloc(allocator, path, "server_resolver");
+    defer allocator.free(cache_resolver);
+    const cache_node_config_ts = try readMetaValueAlloc(allocator, path, "node_config_ts");
+    defer allocator.free(cache_node_config_ts);
+    const cache_xray_count = try readMetaValueAlloc(allocator, path, "xray_count");
+    defer allocator.free(cache_xray_count);
+    const cache_xray_ids_md5 = try readMetaValueAlloc(allocator, path, "xray_ids_md5");
+    defer allocator.free(cache_xray_ids_md5);
+
+    var client = try SkipdClient.connect(socket_path);
+    defer client.deinit();
+    const tfo = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_tfo"));
+    defer allocator.free(tfo);
+    const server_resolver = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv"));
+    defer allocator.free(server_resolver);
+    const resolv_mode_raw = try dupOrEmpty(allocator, try client.getAlloc(allocator, "ss_basic_server_resolv_mode"));
+    defer allocator.free(resolv_mode_raw);
+    const node_config_ts = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_config_ts"));
+    defer allocator.free(node_config_ts);
+
+    const ids_blob = try joinIdsWithNewlineAlloc(allocator, ids);
+    defer allocator.free(ids_blob);
+    const ids_md5 = try md5Hex32Alloc(allocator, ids_blob);
+    defer allocator.free(ids_md5);
+    const current_linux_ver = try linuxVerStringAlloc(allocator);
+    defer allocator.free(current_linux_ver);
+    const expected_resolv_mode = if (std.mem.eql(u8, resolv_mode_raw, "2")) "2" else "1";
+    const expected_tfo = if (tfo.len > 0) tfo else "0";
+    const expected_resolver = if (server_resolver.len > 0) server_resolver else "-1";
+    const expected_node_config_ts = if (node_config_ts.len > 0) node_config_ts else "0";
+    const expected_count = try std.fmt.allocPrint(allocator, "{d}", .{ids.len});
+    defer allocator.free(expected_count);
+
+    return std.mem.eql(u8, cache_rev, "1") and
+        std.mem.eql(u8, gen_rev, "20260326_6") and
+        std.mem.eql(u8, linux_ver, current_linux_ver) and
+        std.mem.eql(u8, cache_tfo, expected_tfo) and
+        std.mem.eql(u8, cache_resolv_mode, expected_resolv_mode) and
+        std.mem.eql(u8, cache_resolver, expected_resolver) and
+        std.mem.eql(u8, cache_node_config_ts, expected_node_config_ts) and
+        std.mem.eql(u8, cache_xray_count, expected_count) and
+        std.mem.eql(u8, cache_xray_ids_md5, ids_md5);
+}
+
+fn collectMissingWebtestIds(allocator: std.mem.Allocator, node_dir: []const u8, meta_dir: []const u8, nodes: []const NodeRecord, ids: []const []const u8, out_path: []const u8) !void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    for (ids) |node_id| {
+        const idx = findNodeIndexById(nodes, node_id) orelse continue;
+        const node = nodes[idx];
+        const out_json_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node_id });
+        defer allocator.free(out_json_path);
+        const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node_id });
+        defer allocator.free(meta_path);
+        if (fileExists(out_json_path) and fileExists(meta_path)) {
+            const cached_rev = try readMetaValueAlloc(allocator, meta_path, "node_rev");
+            defer allocator.free(cached_rev);
+            const current_rev = try std.fmt.allocPrint(allocator, "{d}", .{node.rev});
+            defer allocator.free(current_rev);
+            if (std.mem.eql(u8, cached_rev, current_rev)) continue;
+        }
+        try writer.writeAll(node_id);
+        try writer.writeByte('\n');
+    }
+    try writeFileAtomic(out_path, out.items);
 }
 
 fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []const u8) !void {
@@ -3493,6 +3631,13 @@ fn containsSliceOwned(items: [][]u8, value: []const u8) bool {
     return false;
 }
 
+fn containsSliceConst(items: []const []const u8, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, value)) return true;
+    }
+    return false;
+}
+
 fn isNumericNodeKey(key: []const u8) bool {
     if (!std.mem.startsWith(u8, key, "fss_node_")) return false;
     const suffix = key["fss_node_".len..];
@@ -3980,7 +4125,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
         .dedupe => try writer.writeAll("Usage: node-tool dedupe [--match identity|config|all] [--dry-run] [--socket path]\n"),
-        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
+        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
