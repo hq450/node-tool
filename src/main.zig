@@ -13,6 +13,7 @@ const Command = enum {
     find_duplicates,
     export_sources,
     prune_export_sources,
+    webtest_groups,
     node2json,
     sync_source,
     json2node,
@@ -334,6 +335,18 @@ const SourceExportBucket = struct {
     }
 };
 
+const WebtestGroupBucket = struct {
+    tag: []u8,
+    path: []u8,
+    content: std.ArrayList(u8),
+
+    fn deinit(self: *WebtestGroupBucket, allocator: std.mem.Allocator) void {
+        allocator.free(self.tag);
+        allocator.free(self.path);
+        self.content.deinit(allocator);
+    }
+};
+
 const PlanItem = struct {
     id: []u8,
     name: []u8,
@@ -545,16 +558,20 @@ fn run() !void {
         .prune_export_sources => {
             try runPruneExportSources(allocator, options.query);
         },
-        .list, .stat, .find, .export_sources, .node2json => {
+        .list, .stat, .find, .export_sources, .webtest_groups, .node2json => {
             var nodes = try loadSchema2Nodes(allocator, options.query.socket_path);
             defer freeNodeSlice(allocator, nodes);
             try filterNodeSliceInPlace(allocator, &nodes, options.query);
+            if (options.query.ids_file) |ids_file| {
+                try filterNodeSliceByIdsFileInPlace(allocator, &nodes, ids_file);
+            }
 
             switch (options.command) {
                 .list => try runList(allocator, nodes, options.query),
                 .stat => try runStat(allocator, nodes, options.query),
                 .find => try runFind(allocator, nodes, options.query),
                 .export_sources => try runExportSources(allocator, nodes, options.query),
+                .webtest_groups => try runWebtestGroups(allocator, nodes, options.query),
                 .node2json => try runNode2Json(allocator, nodes, options.query),
                 else => unreachable,
             }
@@ -609,6 +626,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "find-duplicates")) break :blk Command.find_duplicates;
         if (std.mem.eql(u8, args[1], "export-sources")) break :blk Command.export_sources;
         if (std.mem.eql(u8, args[1], "prune-export-sources")) break :blk Command.prune_export_sources;
+        if (std.mem.eql(u8, args[1], "webtest-groups")) break :blk Command.webtest_groups;
         if (std.mem.eql(u8, args[1], "node2json")) break :blk Command.node2json;
         if (std.mem.eql(u8, args[1], "sync-source")) break :blk Command.sync_source;
         if (std.mem.eql(u8, args[1], "json2node")) break :blk Command.json2node;
@@ -938,6 +956,52 @@ fn runExportSources(allocator: std.mem.Allocator, nodes: []const NodeRecord, que
         .json => try writeSourceExportJson(allocator, std.fs.File.stdout().deprecatedWriter(), buckets.items, nodes.len),
         else => unreachable,
     }
+}
+
+fn runWebtestGroups(allocator: std.mem.Allocator, nodes: []const NodeRecord, query: QueryOptions) !void {
+    const output_dir = query.output_dir orelse return error.InvalidArguments;
+    try ensureDirExistsCompat(output_dir);
+
+    var groups = std.ArrayList(WebtestGroupBucket){};
+    defer {
+        for (groups.items) |*group| group.deinit(allocator);
+        groups.deinit(allocator);
+    }
+    var xray_group = std.ArrayList(u8){};
+    defer xray_group.deinit(allocator);
+    var nodes_file_name = std.ArrayList(u8){};
+    defer nodes_file_name.deinit(allocator);
+
+    for (nodes) |node| {
+        const tag = try webtestGroupTagAlloc(allocator, node);
+        defer allocator.free(tag);
+        if (tag.len == 0) continue;
+        const idx = try findOrCreateWebtestGroup(allocator, &groups, output_dir, tag);
+        try groups.items[idx].content.appendSlice(allocator, node.id);
+        try groups.items[idx].content.append(allocator, '\n');
+        if (isWebtestXrayLikeTag(tag)) {
+            try xray_group.appendSlice(allocator, node.id);
+            try xray_group.append(allocator, '\n');
+        }
+    }
+
+    for (groups.items) |group| {
+        try writeFileAtomic(group.path, group.content.items);
+        try nodes_file_name.appendSlice(allocator, group.path);
+        try nodes_file_name.append(allocator, '\n');
+    }
+    if (xray_group.items.len > 0) {
+        const xray_path = try std.fmt.allocPrint(allocator, "{s}/wt_xray_group.txt", .{output_dir});
+        defer allocator.free(xray_path);
+        try writeFileAtomic(xray_path, xray_group.items);
+    }
+    const names_path = try std.fmt.allocPrint(allocator, "{s}/nodes_file_name.txt", .{output_dir});
+    defer allocator.free(names_path);
+    try writeFileAtomic(names_path, nodes_file_name.items);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: webtest-groups\n", .{});
+    try stdout.print("groups: {d}\n", .{groups.items.len});
 }
 
 fn runPruneExportSources(allocator: std.mem.Allocator, query: QueryOptions) !void {
@@ -3874,6 +3938,48 @@ fn findOrCreateSourceBucket(allocator: std.mem.Allocator, buckets: *std.ArrayLis
     return buckets.items.len - 1;
 }
 
+fn findOrCreateWebtestGroup(allocator: std.mem.Allocator, groups: *std.ArrayList(WebtestGroupBucket), output_dir: []const u8, tag: []const u8) !usize {
+    for (groups.items, 0..) |group, idx| {
+        if (std.mem.eql(u8, group.tag, tag)) return idx;
+    }
+    const path = try std.fmt.allocPrint(allocator, "{s}/wt_{d}_{s}.txt", .{ output_dir, groups.items.len + 1, tag });
+    errdefer allocator.free(path);
+    try groups.append(allocator, .{
+        .tag = try allocator.dupe(u8, tag),
+        .path = path,
+        .content = std.ArrayList(u8){},
+    });
+    return groups.items.len - 1;
+}
+
+fn webtestGroupTagAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]u8 {
+    if (std.mem.eql(u8, node.type_id, "0")) {
+        const ss_obfs = try extractStringFieldAlloc(allocator, node.raw_json, "ss_obfs");
+        defer if (ss_obfs) |value| allocator.free(value);
+        const method = try extractStringFieldAlloc(allocator, node.raw_json, "method");
+        defer if (method) |value| allocator.free(value);
+        const obfs_enable = if (ss_obfs) |value| value.len > 0 and !std.mem.eql(u8, value, "0") else false;
+        const is_2022 = if (method) |value| std.mem.indexOf(u8, value, "2022-blake") != null else false;
+        if (is_2022) {
+            return try allocator.dupe(u8, if (obfs_enable) "00_05" else "00_04");
+        }
+        return try allocator.dupe(u8, if (obfs_enable) "00_02" else "00_01");
+    }
+    if (node.type_id.len == 1) return try std.fmt.allocPrint(allocator, "0{s}", .{node.type_id});
+    return try allocator.dupe(u8, node.type_id);
+}
+
+fn isWebtestXrayLikeTag(tag: []const u8) bool {
+    return std.mem.eql(u8, tag, "00_01") or
+        std.mem.eql(u8, tag, "00_02") or
+        std.mem.eql(u8, tag, "00_04") or
+        std.mem.eql(u8, tag, "00_05") or
+        std.mem.eql(u8, tag, "03") or
+        std.mem.eql(u8, tag, "04") or
+        std.mem.eql(u8, tag, "05") or
+        std.mem.eql(u8, tag, "08");
+}
+
 fn writeSourceBuckets(allocator: std.mem.Allocator, buckets: *std.ArrayList(SourceExportBucket)) !void {
     for (buckets.items) |bucket| {
         try writeFileAtomic(bucket.path, bucket.content.items);
@@ -4096,6 +4202,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool find-duplicates [options]\n" ++
         "  node-tool export-sources [options]\n" ++
         "  node-tool prune-export-sources [options]\n" ++
+        "  node-tool webtest-groups [options]\n" ++
         "  node-tool node2json [options]\n" ++
         "  node-tool sync-source [options]\n" ++
         "  node-tool json2node [options]\n" ++
@@ -4118,6 +4225,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
         .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
+        .webtest_groups => try writer.writeAll("Usage: node-tool webtest-groups --output-dir /tmp/fancyss_webtest [--ids 1,2,3 | --ids-file /tmp/ids.txt | --source user|subscribe | --source-tag tag | --airport-identity value | --group name | --protocol type | --name keyword | --identity value] [--socket path]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
         .sync_source => try writer.writeAll("Usage: node-tool sync-source --source-tag tag [--input nodes.jsonl | --stdin] [--reuse-ids] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
