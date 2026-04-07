@@ -3190,7 +3190,19 @@ fn loadWebtestRuntimeConfig(allocator: std.mem.Allocator, socket_path: []const u
 }
 
 fn buildWebtestNodeArtifactNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !bool {
-    if (!std.mem.eql(u8, node.type_id, "0")) return false;
+    if (std.mem.eql(u8, node.type_id, "0")) {
+        return try buildWebtestSsNative(allocator, node, node_dir, meta_dir, runtime_cfg);
+    }
+    if (std.mem.eql(u8, node.type_id, "5")) {
+        return try buildWebtestTrojanNative(allocator, node, node_dir, meta_dir, runtime_cfg);
+    }
+    if (std.mem.eql(u8, node.type_id, "8")) {
+        return try buildWebtestHy2Native(allocator, node, node_dir, meta_dir, runtime_cfg);
+    }
+    return false;
+}
+
+fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !bool {
     const ss_obfs = try extractStringFieldAlloc(allocator, node.raw_json, "ss_obfs");
     defer if (ss_obfs) |value| allocator.free(value);
     if (ss_obfs) |value| {
@@ -3260,6 +3272,167 @@ fn buildWebtestNodeArtifactNative(allocator: std.mem.Allocator, node: NodeRecord
             runtime_cfg.resolver,
             std.time.timestamp(),
         });
+    defer allocator.free(meta);
+    try writeFileAtomic(meta_path, meta);
+    return true;
+}
+
+fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !bool {
+    const password = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_uuid");
+    defer if (password) |value| allocator.free(value);
+    if (password == null or password.?.len == 0) return false;
+    const sni = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_sni");
+    defer if (sni) |value| allocator.free(value);
+    const pcs = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_pcs");
+    defer if (pcs) |value| allocator.free(value);
+    const vcn = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_vcn");
+    defer if (vcn) |value| allocator.free(value);
+    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_ai");
+    defer if (ai) |value| allocator.free(value);
+    const tfo = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_tfo");
+    defer if (tfo) |value| allocator.free(value);
+    const plugin = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_plugin");
+    defer if (plugin) |value| allocator.free(value);
+    const obfs = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_obfs");
+    defer if (obfs) |value| allocator.free(value);
+    const obfsuri = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_obfsuri");
+    defer if (obfsuri) |value| allocator.free(value);
+    const obfshost = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_obfshost");
+    defer if (obfshost) |value| allocator.free(value);
+
+    const is_ws = plugin != null and obfs != null and std.mem.eql(u8, plugin.?, "obfs-local") and std.mem.eql(u8, obfs.?, "websocket");
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
+    defer allocator.free(out_path);
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
+    defer allocator.free(meta_path);
+    const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and tfo != null and std.mem.eql(u8, tfo.?, "1");
+    const allow_insecure = ai != null and std.mem.eql(u8, ai.?, "1");
+    const ws_json = if (is_ws)
+        try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"headers\":{{\"Host\":\"{s}\"}}}}", .{ if (obfsuri) |value| value else "", if (obfshost) |value| value else "" })
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(ws_json);
+    const out_json = try std.fmt.allocPrint(allocator,
+        "{{\n" ++
+            "  \"tag\": \"proxy{s}\",\n" ++
+            "  \"protocol\": \"trojan\",\n" ++
+            "  \"settings\": {{\n" ++
+            "    \"servers\": [{{\"address\": \"{s}\", \"port\": {s}, \"password\": \"{s}\"}}]\n" ++
+            "  }},\n" ++
+            "  \"streamSettings\": {{\n" ++
+            "    \"network\": \"{s}\",\n" ++
+            "    \"security\": \"tls\",\n" ++
+            "    \"tlsSettings\": {{\n" ++
+            "      \"serverName\": \"{s}\",\n" ++
+            "      \"pinnedPeerCertSha256\": \"{s}\",\n" ++
+            "      \"verifyPeerCertByName\": \"{s}\",\n" ++
+            "      \"allowInsecure\": {s}\n" ++
+            "    }},\n" ++
+            "    \"wsSettings\": {s},\n" ++
+            "    \"sockopt\": {{\"tcpFastOpen\": {s}}}\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{
+            node.id,
+            node.server,
+            node.port,
+            password.?,
+            if (is_ws) "ws" else "tcp",
+            if (sni) |value| value else "",
+            if (pcs) |value| value else "",
+            if (vcn) |value| value else "",
+            if (allow_insecure) "true" else "false",
+            ws_json,
+            if (tcp_fast_open) "true" else "false",
+        },
+    );
+    defer allocator.free(out_json);
+    try writeFileAtomic(out_path, out_json);
+
+    const meta = try std.fmt.allocPrint(allocator,
+        "node_type=5\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
+        .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
+    );
+    defer allocator.free(meta);
+    try writeFileAtomic(meta_path, meta);
+    return true;
+}
+
+fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig) !bool {
+    const pass = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_pass");
+    defer if (pass) |value| allocator.free(value);
+    if (pass == null or pass.?.len == 0) return false;
+    const up = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_up");
+    defer if (up) |value| allocator.free(value);
+    const dl = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_dl");
+    defer if (dl) |value| allocator.free(value);
+    const obfs = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_obfs");
+    defer if (obfs) |value| allocator.free(value);
+    const obfs_pass = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_obfs_pass");
+    defer if (obfs_pass) |value| allocator.free(value);
+    const sni = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_sni");
+    defer if (sni) |value| allocator.free(value);
+    const pcs = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_pcs");
+    defer if (pcs) |value| allocator.free(value);
+    const vcn = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_vcn");
+    defer if (vcn) |value| allocator.free(value);
+    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_ai");
+    defer if (ai) |value| allocator.free(value);
+    const tfo = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_tfo");
+    defer if (tfo) |value| allocator.free(value);
+    const cg = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_cg");
+    defer if (cg) |value| allocator.free(value);
+    const allow_insecure = ai != null and std.mem.eql(u8, ai.?, "1");
+    const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and tfo != null and std.mem.eql(u8, tfo.?, "1");
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
+    defer allocator.free(out_path);
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
+    defer allocator.free(meta_path);
+    const up_value = if (up) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
+    defer allocator.free(up_value);
+    const dl_value = if (dl) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
+    defer allocator.free(dl_value);
+    const finalmask_value = if (obfs != null and std.mem.eql(u8, obfs.?, "1") and obfs_pass != null and obfs_pass.?.len > 0)
+        try std.fmt.allocPrint(allocator, ",\n    \"finalmask\": {{\"udp\": [{{\"type\": \"salamander\", \"settings\": {{\"password\": \"{s}\"}}}}]}}", .{obfs_pass.?})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(finalmask_value);
+    const out_json = try std.fmt.allocPrint(allocator,
+        "{{\n" ++
+            "  \"tag\": \"proxy{s}\",\n" ++
+            "  \"protocol\": \"hysteria\",\n" ++
+            "  \"settings\": {{\"version\": 2, \"address\": \"{s}\", \"port\": {s}}},\n" ++
+            "  \"streamSettings\": {{\n" ++
+            "    \"network\": \"hysteria\",\n" ++
+            "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\", \"congestion\": \"{s}\", \"up\": \"{s}\", \"down\": \"{s}\", \"udphop\": {{\"port\": \"\", \"interval\": 30}}}},\n" ++
+            "    \"security\": \"tls\",\n" ++
+            "    \"tlsSettings\": {{\"serverName\": \"{s}\", \"pinnedPeerCertSha256\": \"{s}\", \"verifyPeerCertByName\": \"{s}\", \"allowInsecure\": {s}, \"alpn\": [\"h3\"]}},\n" ++
+            "    \"sockopt\": {{\"tcpFastOpen\": {s}}}{s}\n" ++
+            "  }}\n" ++
+            "}}\n",
+        .{
+            node.id,
+            node.server,
+            node.port,
+            pass.?,
+            if (cg) |value| value else "bbr",
+            up_value,
+            dl_value,
+            if (sni) |value| value else node.server,
+            if (pcs) |value| value else "",
+            if (vcn) |value| value else "",
+            if (allow_insecure) "true" else "false",
+            if (tcp_fast_open) "true" else "false",
+            finalmask_value,
+        },
+    );
+    defer allocator.free(out_json);
+    try writeFileAtomic(out_path, out_json);
+
+    const meta = try std.fmt.allocPrint(allocator,
+        "node_type=8\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
+        .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
+    );
     defer allocator.free(meta);
     try writeFileAtomic(meta_path, meta);
     return true;
