@@ -370,6 +370,24 @@ const WebtestRuntimeConfig = struct {
     }
 };
 
+const RuntimeArtifactSummary = struct {
+    native_count: usize = 0,
+    shell_count: usize = 0,
+    missing_count: usize = 0,
+    other_count: usize = 0,
+    shell_reasons: std.ArrayList(StatItem),
+
+    fn init() RuntimeArtifactSummary {
+        return .{
+            .shell_reasons = std.ArrayList(StatItem){},
+        };
+    }
+
+    fn deinit(self: *RuntimeArtifactSummary, allocator: std.mem.Allocator) void {
+        freeStatItems(allocator, &self.shell_reasons);
+    }
+};
+
 const PlanItem = struct {
     id: []u8,
     name: []u8,
@@ -1517,18 +1535,28 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     try stdout.print("env: {d}\n", .{env_count});
     try stdout.print("direct_domains: {d}\n", .{direct_count});
     try stdout.print("webtest: {d}\n", .{webtest_count});
+    if (do_webtest) {
+        var summary = try collectRuntimeArtifactSummary(allocator, "/koolshare/configs/fancyss/webtest_cache/meta", targets, .webtest);
+        defer summary.deinit(allocator);
+        try writeRuntimeArtifactSummary(stdout, summary);
+    }
 }
 
 fn runRuntimeArtifact(allocator: std.mem.Allocator, nodes: []const NodeRecord, query: QueryOptions) !void {
     const output_dir = query.output_dir orelse return error.InvalidArguments;
     const profile = try resolveRuntimeArtifactProfile(query.profile);
     const count = try materializeRuntimeArtifactsFresh(allocator, query.socket_path, nodes, output_dir, profile);
+    const meta_dir = try std.fmt.allocPrint(allocator, "{s}/meta", .{output_dir});
+    defer allocator.free(meta_dir);
+    var summary = try collectRuntimeArtifactSummary(allocator, meta_dir, nodes, profile);
+    defer summary.deinit(allocator);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("command: runtime-artifact\n", .{});
     try stdout.print("profile: {s}\n", .{runtimeArtifactProfileLabel(profile)});
     try stdout.print("output_dir: {s}\n", .{output_dir});
     try stdout.print("count: {d}\n", .{count});
+    try writeRuntimeArtifactSummary(stdout, summary);
 }
 
 fn filterNodeSliceByIdsFileInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, ids_file: []const u8) !void {
@@ -3394,6 +3422,47 @@ fn writeRuntimeArtifactIndexAndAggregate(allocator: std.mem.Allocator, paths: Ru
     } else {
         std.fs.cwd().deleteFile(paths.index_file) catch {};
         std.fs.cwd().deleteFile(paths.agg_file) catch {};
+    }
+}
+
+fn collectRuntimeArtifactSummary(allocator: std.mem.Allocator, meta_dir: []const u8, nodes: []const NodeRecord, profile: RuntimeArtifactProfile) !RuntimeArtifactSummary {
+    var summary = RuntimeArtifactSummary.init();
+    errdefer summary.deinit(allocator);
+
+    for (nodes) |node| {
+        if (!runtimeArtifactProfileAcceptsNode(profile, node)) continue;
+        const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
+        defer allocator.free(meta_path);
+        if (!fileExists(meta_path)) {
+            summary.missing_count += 1;
+            continue;
+        }
+
+        const builder = try readMetaValueAlloc(allocator, meta_path, "builder");
+        defer allocator.free(builder);
+        const reason = try readMetaValueAlloc(allocator, meta_path, "builder_reason");
+        defer allocator.free(reason);
+
+        if (std.mem.eql(u8, builder, "native")) {
+            summary.native_count += 1;
+        } else if (std.mem.eql(u8, builder, "shell")) {
+            summary.shell_count += 1;
+            try bumpStatItem(allocator, &summary.shell_reasons, if (reason.len > 0) reason else "unknown");
+        } else {
+            summary.other_count += 1;
+        }
+    }
+
+    return summary;
+}
+
+fn writeRuntimeArtifactSummary(writer: anytype, summary: RuntimeArtifactSummary) !void {
+    try writer.print("builder_native: {d}\n", .{summary.native_count});
+    try writer.print("builder_shell: {d}\n", .{summary.shell_count});
+    if (summary.missing_count > 0) try writer.print("builder_missing: {d}\n", .{summary.missing_count});
+    if (summary.other_count > 0) try writer.print("builder_other: {d}\n", .{summary.other_count});
+    for (summary.shell_reasons.items) |item| {
+        try writer.print("shell_reason: {s}={d}\n", .{ item.key, item.count });
     }
 }
 
