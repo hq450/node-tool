@@ -3466,6 +3466,31 @@ fn writeRuntimeArtifactSummary(writer: anytype, summary: RuntimeArtifactSummary)
     }
 }
 
+fn persistRuntimeArtifactSummaryMeta(allocator: std.mem.Allocator, meta_path: []const u8, summary: RuntimeArtifactSummary) !void {
+    const native_text = try std.fmt.allocPrint(allocator, "{d}", .{summary.native_count});
+    defer allocator.free(native_text);
+    const shell_text = try std.fmt.allocPrint(allocator, "{d}", .{summary.shell_count});
+    defer allocator.free(shell_text);
+    const missing_text = try std.fmt.allocPrint(allocator, "{d}", .{summary.missing_count});
+    defer allocator.free(missing_text);
+    const other_text = try std.fmt.allocPrint(allocator, "{d}", .{summary.other_count});
+    defer allocator.free(other_text);
+
+    try upsertMetaValue(meta_path, "builder_native", native_text);
+    try upsertMetaValue(meta_path, "builder_shell", shell_text);
+    try upsertMetaValue(meta_path, "builder_missing", missing_text);
+    try upsertMetaValue(meta_path, "builder_other", other_text);
+
+    var reasons = std.ArrayList(u8){};
+    defer reasons.deinit(allocator);
+    const writer = reasons.writer(allocator);
+    for (summary.shell_reasons.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{s}={d}", .{ item.key, item.count });
+    }
+    try upsertMetaValue(meta_path, "builder_shell_reasons", reasons.items);
+}
+
 fn materializeRuntimeArtifactsFresh(allocator: std.mem.Allocator, socket_path: []const u8, nodes: []const NodeRecord, output_dir: []const u8, profile: RuntimeArtifactProfile) !usize {
     var paths = try initRuntimeArtifactPaths(allocator, output_dir);
     defer paths.deinit(allocator);
@@ -3501,6 +3526,9 @@ fn materializeRuntimeArtifactsFresh(allocator: std.mem.Allocator, socket_path: [
     try buildWebtestNodeArtifactsWithShell(allocator, ids_file, nodes, paths.root_dir, paths.node_dir, paths.meta_dir, runtime_cfg, &obfs_start_ports);
     try writeRuntimeArtifactIndexAndAggregate(allocator, paths, ids.items);
     try writeWebtestGlobalMeta(allocator, socket_path, paths.global_meta_file, ids.items, runtimeArtifactProfileLabel(profile));
+    var summary = try collectRuntimeArtifactSummary(allocator, paths.meta_dir, nodes, profile);
+    defer summary.deinit(allocator);
+    try persistRuntimeArtifactSummaryMeta(allocator, paths.global_meta_file, summary);
     return ids.items.len;
 }
 
@@ -3599,6 +3627,9 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
     }
 
     try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items, "webtest");
+    var summary = try collectRuntimeArtifactSummary(allocator, meta_dir, nodes, .webtest);
+    defer summary.deinit(allocator);
+    try persistRuntimeArtifactSummaryMeta(allocator, global_meta_file, summary);
     return ids.items.len;
 }
 
