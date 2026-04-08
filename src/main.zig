@@ -1422,6 +1422,7 @@ fn runCompactIds(allocator: std.mem.Allocator, state: *SchemaState, query: Query
     state.next_id = state.nodes.len + 1;
     if (!query.dry_run and changed > 0) {
         try writeSchema2State(allocator, query.socket_path, old_nodes, state);
+        clearNodeIdBoundCaches();
     }
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -1430,6 +1431,12 @@ fn runCompactIds(allocator: std.mem.Allocator, state: *SchemaState, query: Query
     try stdout.print("changed: {d}\n", .{changed});
     try stdout.print("final_count: {d}\n", .{state.nodes.len});
     try stdout.print("next_id: {d}\n", .{state.next_id});
+}
+
+fn clearNodeIdBoundCaches() void {
+    std.fs.cwd().deleteTree("/koolshare/configs/fancyss/node_json_cache") catch {};
+    std.fs.cwd().deleteFile("/koolshare/configs/fancyss/node_json_cache.meta") catch {};
+    std.fs.cwd().deleteTree("/koolshare/configs/fancyss/webtest_cache") catch {};
 }
 
 fn runReorder(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
