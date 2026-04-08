@@ -1480,7 +1480,7 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     }
 
     const no_specific = !query.warm_env and !query.warm_json and !query.warm_direct_domains and !query.warm_webtest;
-    const do_env = query.warm_env or no_specific;
+    const do_env = query.warm_env;
     const do_json = query.warm_json or no_specific;
     const do_direct = query.warm_direct_domains or no_specific;
     const do_webtest = query.warm_webtest or no_specific;
@@ -1495,7 +1495,6 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     if (do_direct) direct_count = try warmDirectDomainsCache(allocator, state.nodes);
     if (do_webtest) {
         if (!do_json) json_count = try warmJsonCache(allocator, targets);
-        if (!do_env) env_count = try warmEnvCache(allocator, targets);
         webtest_count = try warmWebtestArtifacts(allocator, query.socket_path, targets);
     }
 
@@ -3304,7 +3303,6 @@ fn buildWebtestNodeArtifactsWithShell(allocator: std.mem.Allocator, ids_file: []
         ". /koolshare/scripts/ss_base.sh\n" ++
         ". /koolshare/scripts/ss_webtest.sh >/dev/null 2>&1\n" ++
         "WT_NODE_CACHE_DIR=\"$FSS_NODE_JSON_CACHE_DIR\"\n" ++
-        "WT_NODE_ENV_DIR=\"$FSS_NODE_ENV_CACHE_DIR\"\n" ++
         "wt_webtest_cache_prepare_dirs || exit 1\n" ++
         "wt_init_reserved_ports\n" ++
         "wt_reset_active_node_env\n" ++
