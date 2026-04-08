@@ -10,6 +10,7 @@ const Command = enum {
     list,
     stat,
     find,
+    airport_domains,
     find_duplicates,
     export_sources,
     prune_export_sources,
@@ -21,6 +22,7 @@ const Command = enum {
     delete_node,
     delete_nodes,
     dedupe,
+    compact_ids,
     warm_cache,
     reorder,
     plan,
@@ -572,7 +574,7 @@ fn run() !void {
         .prune_export_sources => {
             try runPruneExportSources(allocator, options.query);
         },
-        .list, .stat, .find, .export_sources, .webtest_groups, .node2json => {
+        .list, .stat, .find, .airport_domains, .export_sources, .webtest_groups, .node2json => {
             var nodes = try loadSchema2Nodes(allocator, options.query.socket_path);
             defer freeNodeSlice(allocator, nodes);
             try filterNodeSliceInPlace(allocator, &nodes, options.query);
@@ -584,6 +586,7 @@ fn run() !void {
                 .list => try runList(allocator, nodes, options.query),
                 .stat => try runStat(allocator, nodes, options.query),
                 .find => try runFind(allocator, nodes, options.query),
+                .airport_domains => try runAirportDomains(allocator, nodes, options.query),
                 .export_sources => try runExportSources(allocator, nodes, options.query),
                 .webtest_groups => try runWebtestGroups(allocator, nodes, options.query),
                 .node2json => try runNode2Json(allocator, nodes, options.query),
@@ -595,7 +598,7 @@ fn run() !void {
             defer state.deinit(allocator);
             try runFindDuplicates(allocator, &state, options.query);
         },
-        .sync_source, .json2node, .add_node, .delete_node, .delete_nodes => {
+        .sync_source, .json2node, .add_node, .delete_node, .delete_nodes, .compact_ids => {
             var state = try loadSchema2State(allocator, options.query.socket_path);
             defer state.deinit(allocator);
             switch (options.command) {
@@ -604,6 +607,7 @@ fn run() !void {
                 .add_node => try runAddNode(allocator, &state, options.query),
                 .delete_node => try runDeleteNode(allocator, &state, options.query),
                 .delete_nodes => try runDeleteNodes(allocator, &state, options.query),
+                .compact_ids => try runCompactIds(allocator, &state, options.query),
                 else => unreachable,
             }
         },
@@ -637,6 +641,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "list")) break :blk Command.list;
         if (std.mem.eql(u8, args[1], "stat")) break :blk Command.stat;
         if (std.mem.eql(u8, args[1], "find")) break :blk Command.find;
+        if (std.mem.eql(u8, args[1], "airport-domains")) break :blk Command.airport_domains;
         if (std.mem.eql(u8, args[1], "find-duplicates")) break :blk Command.find_duplicates;
         if (std.mem.eql(u8, args[1], "export-sources")) break :blk Command.export_sources;
         if (std.mem.eql(u8, args[1], "prune-export-sources")) break :blk Command.prune_export_sources;
@@ -648,6 +653,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "delete-node")) break :blk Command.delete_node;
         if (std.mem.eql(u8, args[1], "delete-nodes")) break :blk Command.delete_nodes;
         if (std.mem.eql(u8, args[1], "dedupe")) break :blk Command.dedupe;
+        if (std.mem.eql(u8, args[1], "compact-ids")) break :blk Command.compact_ids;
         if (std.mem.eql(u8, args[1], "warm-cache")) break :blk Command.warm_cache;
         if (std.mem.eql(u8, args[1], "reorder")) break :blk Command.reorder;
         if (std.mem.eql(u8, args[1], "plan")) break :blk Command.plan;
@@ -805,6 +811,68 @@ fn runFind(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOption
         .jsonl => try writeListJson(allocator, std.fs.File.stdout().deprecatedWriter(), nodes, true),
         else => unreachable,
     }
+}
+
+fn runAirportDomains(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOptions) !void {
+    const format = try resolveAirportDomainsFormat(query.format);
+    var items = std.ArrayList([]u8){};
+    defer {
+        for (items.items) |item| allocator.free(item);
+        items.deinit(allocator);
+    }
+
+    for (nodes) |node| {
+        if (node.server.len == 0) continue;
+        if (!looksLikeDomain(node.server)) continue;
+        const airport = try effectiveAirportIdentityAlloc(allocator, node);
+        defer allocator.free(airport);
+        const line = try std.fmt.allocPrint(allocator, "{s}\t{s}", .{ airport, node.server });
+        if (containsSlice(items.items, line)) {
+            allocator.free(line);
+            continue;
+        }
+        try items.append(allocator, line);
+    }
+
+    std.mem.sort([]u8, items.items, {}, lessThanString);
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    switch (format) {
+        .text => {
+            for (items.items) |item| {
+                try stdout.writeAll(item);
+                try stdout.writeAll("\n");
+            }
+        },
+        .json => {
+            try stdout.writeAll("[");
+            for (items.items, 0..) |item, idx| {
+                const tab_pos = std.mem.indexOfScalar(u8, item, '\t') orelse continue;
+                if (idx > 0) try stdout.writeAll(",");
+                try stdout.writeAll("{\"airport_identity\":");
+                try writeJsonString(stdout, item[0..tab_pos]);
+                try stdout.writeAll(",\"domain\":");
+                try writeJsonString(stdout, item[tab_pos + 1 ..]);
+                try stdout.writeAll("}");
+            }
+            try stdout.writeAll("]\n");
+        },
+        else => unreachable,
+    }
+}
+
+fn effectiveAirportIdentityAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]const u8 {
+    if (std.mem.eql(u8, node.source, "subscribe")) {
+        if (splitGroupSuffix(node.group)) |parts| {
+            return try slugifyAlloc(allocator, parts.base, "sub");
+        }
+        if (node.group.len > 0) {
+            return try slugifyAlloc(allocator, node.group, "sub");
+        }
+    }
+    if (node.airport_identity.len > 0) {
+        return try allocator.dupe(u8, node.airport_identity);
+    }
+    return try allocator.dupe(u8, "local");
 }
 
 fn runFindDuplicates(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
@@ -1289,6 +1357,50 @@ fn runDeleteNodes(allocator: std.mem.Allocator, state: *SchemaState, query: Quer
     try printMutationSummary("delete-nodes", 0, 0, removed, 0, state.nodes.len, query.dry_run);
 }
 
+fn rewriteNodeIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8, new_id: []const u8) ![]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, raw_json, .{});
+    const root = &parsed.value;
+    if (root.* != .object) return error.InvalidArguments;
+    const obj = &root.object;
+    try jsonPutString(arena, obj, "_id", new_id);
+    return try renderCompactJsonAlloc(allocator, root.*);
+}
+
+fn runCompactIds(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
+    const old_nodes = try cloneNodeSlice(allocator, state.nodes);
+    defer freeNodeSlice(allocator, old_nodes);
+
+    var changed: usize = 0;
+    for (state.nodes, 0..) |*node, idx| {
+        const new_id = try std.fmt.allocPrint(allocator, "{d}", .{idx + 1});
+        defer allocator.free(new_id);
+        if (std.mem.eql(u8, node.id, new_id)) continue;
+
+        const rewritten = try rewriteNodeIdAlloc(allocator, node.raw_json, new_id);
+        allocator.free(node.raw_json);
+        node.raw_json = rewritten;
+        allocator.free(node.id);
+        node.id = try allocator.dupe(u8, new_id);
+        changed += 1;
+    }
+
+    state.next_id = state.nodes.len + 1;
+    if (!query.dry_run and changed > 0) {
+        try writeSchema2State(allocator, query.socket_path, old_nodes, state);
+    }
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: compact-ids\n", .{});
+    try stdout.print("dry_run: {s}\n", .{if (query.dry_run) "1" else "0"});
+    try stdout.print("changed: {d}\n", .{changed});
+    try stdout.print("final_count: {d}\n", .{state.nodes.len});
+    try stdout.print("next_id: {d}\n", .{state.next_id});
+}
+
 fn runReorder(allocator: std.mem.Allocator, state: *SchemaState, query: QueryOptions) !void {
     const old_nodes = try cloneNodeSlice(allocator, state.nodes);
     defer freeNodeSlice(allocator, old_nodes);
@@ -1476,6 +1588,13 @@ fn resolveExportSourcesFormat(raw: ?[]const u8) !OutputFormat {
     if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
     if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
     if (std.ascii.eqlIgnoreCase(format, "shell")) return .shell;
+    return error.InvalidArguments;
+}
+
+fn resolveAirportDomainsFormat(raw: ?[]const u8) !OutputFormat {
+    const format = raw orelse "text";
+    if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
+    if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
     return error.InvalidArguments;
 }
 
@@ -4846,6 +4965,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool list [options]\n" ++
         "  node-tool stat [options]\n" ++
         "  node-tool find [options]\n" ++
+        "  node-tool airport-domains [options]\n" ++
         "  node-tool find-duplicates [options]\n" ++
         "  node-tool export-sources [options]\n" ++
         "  node-tool prune-export-sources [options]\n" ++
@@ -4857,6 +4977,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool delete-node [options]\n" ++
         "  node-tool delete-nodes [options]\n" ++
         "  node-tool dedupe [options]\n" ++
+        "  node-tool compact-ids [options]\n" ++
         "  node-tool warm-cache [options]\n" ++
         "  node-tool reorder [options]\n" ++
         "  node-tool plan [options]\n" ++
@@ -4869,6 +4990,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
         .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
+        .airport_domains => try writer.writeAll("Usage: node-tool airport-domains [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
         .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
@@ -4880,6 +5002,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .delete_node => try writer.writeAll("Usage: node-tool delete-node [--ids 23 | --identity xxx_yyy | --name keyword] [--dry-run] [--socket path]\n"),
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
         .dedupe => try writer.writeAll("Usage: node-tool dedupe [--match identity|config|all] [--dry-run] [--socket path]\n"),
+        .compact_ids => try writer.writeAll("Usage: node-tool compact-ids [--dry-run] [--socket path]\n"),
         .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
