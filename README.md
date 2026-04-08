@@ -46,6 +46,7 @@ node-tool delete-node
 node-tool delete-nodes
 node-tool dedupe
 node-tool warm-cache
+node-tool runtime-artifact
 node-tool reorder
 node-tool plan
 node-tool version
@@ -60,6 +61,7 @@ node-tool version
 - 通过 Unix socket 直接访问 `skipd`，不依赖外部 `dbus` 可执行文件
 - 当前只支持 `schema2`
 - `warm-cache` 已实现 `json / env / direct-domains / webtest 节点级产物与聚合物料` 四类缓存预热
+- `runtime-artifact` 已提供显式的统一运行产物导出入口，当前支持 `webtest / shunt` 两种 profile
 - `json2node --reuse-ids` 已支持按 `_identity / _source_scope + _identity_secondary / _identity_primary` 复用旧节点
 - `json2node --mode replace --reuse-ids` 在输入与现网一致时不会触发无意义重写
 - `plan` 已输出 `added / updated / removed / moved / current_before / current_after / failover_before / failover_after / final_order`

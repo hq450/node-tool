@@ -24,6 +24,7 @@ const Command = enum {
     dedupe,
     compact_ids,
     warm_cache,
+    runtime_artifact,
     reorder,
     plan,
     version,
@@ -40,6 +41,11 @@ const OutputFormat = enum {
 const MutationMode = enum {
     append,
     replace,
+};
+
+const RuntimeArtifactProfile = enum {
+    webtest,
+    shunt,
 };
 
 const Options = struct {
@@ -61,6 +67,7 @@ const QueryOptions = struct {
     input: ?[]const u8 = null,
     ids_file: ?[]const u8 = null,
     output_dir: ?[]const u8 = null,
+    profile: ?[]const u8 = null,
     meta_path: ?[]const u8 = null,
     all_jsonl_path: ?[]const u8 = null,
     active_source_tags_path: ?[]const u8 = null,
@@ -574,7 +581,7 @@ fn run() !void {
         .prune_export_sources => {
             try runPruneExportSources(allocator, options.query);
         },
-        .list, .stat, .find, .airport_domains, .export_sources, .webtest_groups, .node2json => {
+        .list, .stat, .find, .airport_domains, .export_sources, .webtest_groups, .node2json, .runtime_artifact => {
             var nodes = try loadSchema2Nodes(allocator, options.query.socket_path);
             defer freeNodeSlice(allocator, nodes);
             try filterNodeSliceInPlace(allocator, &nodes, options.query);
@@ -590,6 +597,7 @@ fn run() !void {
                 .export_sources => try runExportSources(allocator, nodes, options.query),
                 .webtest_groups => try runWebtestGroups(allocator, nodes, options.query),
                 .node2json => try runNode2Json(allocator, nodes, options.query),
+                .runtime_artifact => try runRuntimeArtifact(allocator, nodes, options.query),
                 else => unreachable,
             }
         },
@@ -655,6 +663,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "dedupe")) break :blk Command.dedupe;
         if (std.mem.eql(u8, args[1], "compact-ids")) break :blk Command.compact_ids;
         if (std.mem.eql(u8, args[1], "warm-cache")) break :blk Command.warm_cache;
+        if (std.mem.eql(u8, args[1], "runtime-artifact")) break :blk Command.runtime_artifact;
         if (std.mem.eql(u8, args[1], "reorder")) break :blk Command.reorder;
         if (std.mem.eql(u8, args[1], "plan")) break :blk Command.plan;
         if (std.mem.eql(u8, args[1], "version")) break :blk Command.version;
@@ -720,6 +729,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.output_dir = args[i];
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.profile = args[i];
         } else if (std.mem.eql(u8, arg, "--meta")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -1504,6 +1517,18 @@ fn runWarmCache(allocator: std.mem.Allocator, state: *SchemaState, query: QueryO
     try stdout.print("env: {d}\n", .{env_count});
     try stdout.print("direct_domains: {d}\n", .{direct_count});
     try stdout.print("webtest: {d}\n", .{webtest_count});
+}
+
+fn runRuntimeArtifact(allocator: std.mem.Allocator, nodes: []const NodeRecord, query: QueryOptions) !void {
+    const output_dir = query.output_dir orelse return error.InvalidArguments;
+    const profile = try resolveRuntimeArtifactProfile(query.profile);
+    const count = try materializeRuntimeArtifactsFresh(allocator, query.socket_path, nodes, output_dir, profile);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: runtime-artifact\n", .{});
+    try stdout.print("profile: {s}\n", .{runtimeArtifactProfileLabel(profile)});
+    try stdout.print("output_dir: {s}\n", .{output_dir});
+    try stdout.print("count: {d}\n", .{count});
 }
 
 fn filterNodeSliceByIdsFileInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, ids_file: []const u8) !void {
@@ -3267,6 +3292,123 @@ fn buildWebtestObfsStartPortMap(allocator: std.mem.Allocator, ids_file: []const 
     return port_map;
 }
 
+const RuntimeArtifactPaths = struct {
+    root_dir: []u8,
+    node_dir: []u8,
+    meta_dir: []u8,
+    index_file: []u8,
+    agg_file: []u8,
+    global_meta_file: []u8,
+
+    fn deinit(self: *RuntimeArtifactPaths, allocator: std.mem.Allocator) void {
+        allocator.free(self.root_dir);
+        allocator.free(self.node_dir);
+        allocator.free(self.meta_dir);
+        allocator.free(self.index_file);
+        allocator.free(self.agg_file);
+        allocator.free(self.global_meta_file);
+    }
+};
+
+fn initRuntimeArtifactPaths(allocator: std.mem.Allocator, output_dir: []const u8) !RuntimeArtifactPaths {
+    return .{
+        .root_dir = try allocator.dupe(u8, output_dir),
+        .node_dir = try std.fmt.allocPrint(allocator, "{s}/nodes", .{output_dir}),
+        .meta_dir = try std.fmt.allocPrint(allocator, "{s}/meta", .{output_dir}),
+        .index_file = try std.fmt.allocPrint(allocator, "{s}/materialize_index.txt", .{output_dir}),
+        .agg_file = try std.fmt.allocPrint(allocator, "{s}/all_outbounds.json", .{output_dir}),
+        .global_meta_file = try std.fmt.allocPrint(allocator, "{s}/cache.meta", .{output_dir}),
+    };
+}
+
+fn resetRuntimeArtifactOutput(paths: RuntimeArtifactPaths) !void {
+    std.fs.cwd().deleteTree(paths.node_dir) catch {};
+    std.fs.cwd().deleteTree(paths.meta_dir) catch {};
+    std.fs.cwd().deleteFile(paths.index_file) catch {};
+    std.fs.cwd().deleteFile(paths.agg_file) catch {};
+    std.fs.cwd().deleteFile(paths.global_meta_file) catch {};
+    try ensureDirExistsCompat(paths.root_dir);
+    try ensureDirExistsCompat(paths.node_dir);
+    try ensureDirExistsCompat(paths.meta_dir);
+}
+
+fn writeRuntimeArtifactIndexAndAggregate(allocator: std.mem.Allocator, paths: RuntimeArtifactPaths, ids: []const []const u8) !void {
+    var index = std.ArrayList(u8){};
+    defer index.deinit(allocator);
+    var aggregate = std.ArrayList(u8){};
+    defer aggregate.deinit(allocator);
+    const agg_writer = aggregate.writer(allocator);
+    try agg_writer.writeAll("{\n  \"outbounds\": [\n");
+    var first_out = true;
+
+    for (ids) |node_id| {
+        const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ paths.meta_dir, node_id });
+        defer allocator.free(meta_path);
+        const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ paths.node_dir, node_id });
+        defer allocator.free(out_path);
+        if (!fileExists(meta_path) or !fileExists(out_path)) continue;
+
+        const start_port = try readMetaValueAlloc(allocator, meta_path, "start_port");
+        defer allocator.free(start_port);
+        if (index.items.len > 0) try index.append(allocator, '\n');
+        try index.appendSlice(allocator, node_id);
+        try index.append(allocator, '|');
+        try index.appendSlice(allocator, start_port);
+
+        const out_json = try readFileAllocCompat(allocator, out_path, max_skipd_frame);
+        defer allocator.free(out_json);
+        if (!first_out) try agg_writer.writeAll(",\n");
+        first_out = false;
+        try agg_writer.writeAll(out_json);
+    }
+    try agg_writer.writeAll("\n  ]\n}\n");
+
+    if (index.items.len > 0) {
+        try writeFileAtomic(paths.index_file, index.items);
+        try writeFileAtomic(paths.agg_file, aggregate.items);
+    } else {
+        std.fs.cwd().deleteFile(paths.index_file) catch {};
+        std.fs.cwd().deleteFile(paths.agg_file) catch {};
+    }
+}
+
+fn materializeRuntimeArtifactsFresh(allocator: std.mem.Allocator, socket_path: []const u8, nodes: []const NodeRecord, output_dir: []const u8, profile: RuntimeArtifactProfile) !usize {
+    var paths = try initRuntimeArtifactPaths(allocator, output_dir);
+    defer paths.deinit(allocator);
+
+    try resetRuntimeArtifactOutput(paths);
+
+    var ids = std.ArrayList([]const u8){};
+    defer ids.deinit(allocator);
+    for (nodes) |node| {
+        if (!runtimeArtifactProfileAcceptsNode(profile, node)) continue;
+        try ids.append(allocator, node.id);
+    }
+    std.mem.sort([]const u8, ids.items, {}, lessThanNumericString);
+
+    if (ids.items.len == 0) {
+        return 0;
+    }
+
+    const ids_file = try std.fmt.allocPrint(allocator, "/tmp/node_tool_runtime_ids_{d}.txt", .{std.time.microTimestamp()});
+    defer {
+        std.fs.cwd().deleteFile(ids_file) catch {};
+        allocator.free(ids_file);
+    }
+    const ids_blob = try joinIdsWithNewlineAlloc(allocator, ids.items);
+    defer allocator.free(ids_blob);
+    try writeFileAtomic(ids_file, ids_blob);
+
+    var runtime_cfg = try loadWebtestRuntimeConfig(allocator, socket_path);
+    defer runtime_cfg.deinit(allocator);
+    var obfs_start_ports = try buildWebtestObfsStartPortMap(allocator, ids_file, nodes, paths.index_file);
+    defer obfs_start_ports.deinit();
+    try buildWebtestNodeArtifactsWithShell(allocator, ids_file, nodes, paths.node_dir, paths.meta_dir, runtime_cfg, &obfs_start_ports);
+    try writeRuntimeArtifactIndexAndAggregate(allocator, paths, ids.items);
+    try writeWebtestGlobalMeta(allocator, socket_path, paths.global_meta_file, ids.items, runtimeArtifactProfileLabel(profile));
+    return ids.items.len;
+}
+
 fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, nodes: []const NodeRecord) !usize {
     const cache_dir = "/koolshare/configs/fancyss/webtest_cache";
     const node_dir = "/koolshare/configs/fancyss/webtest_cache/nodes";
@@ -3361,7 +3503,7 @@ fn warmWebtestArtifacts(allocator: std.mem.Allocator, socket_path: []const u8, n
         std.fs.cwd().deleteFile(agg_file) catch {};
     }
 
-    try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items);
+    try writeWebtestGlobalMeta(allocator, socket_path, global_meta_file, ids.items, "webtest");
     return ids.items.len;
 }
 
@@ -4425,6 +4567,37 @@ fn isWebtestXrayLike(node: NodeRecord) bool {
         std.mem.eql(u8, node.type_id, "8");
 }
 
+fn isShuntRuntimeSupported(node: NodeRecord) bool {
+    if (std.mem.eql(u8, node.type_id, "0")) {
+        return !containsSsObfs(node.raw_json);
+    }
+    return std.mem.eql(u8, node.type_id, "3") or
+        std.mem.eql(u8, node.type_id, "4") or
+        std.mem.eql(u8, node.type_id, "5") or
+        std.mem.eql(u8, node.type_id, "8");
+}
+
+fn runtimeArtifactProfileLabel(profile: RuntimeArtifactProfile) []const u8 {
+    return switch (profile) {
+        .webtest => "webtest",
+        .shunt => "shunt",
+    };
+}
+
+fn resolveRuntimeArtifactProfile(value: ?[]const u8) !RuntimeArtifactProfile {
+    const profile = value orelse return error.InvalidArguments;
+    if (std.ascii.eqlIgnoreCase(profile, "webtest")) return .webtest;
+    if (std.ascii.eqlIgnoreCase(profile, "shunt")) return .shunt;
+    return error.InvalidArguments;
+}
+
+fn runtimeArtifactProfileAcceptsNode(profile: RuntimeArtifactProfile, node: NodeRecord) bool {
+    return switch (profile) {
+        .webtest => isWebtestXrayLike(node),
+        .shunt => isShuntRuntimeSupported(node),
+    };
+}
+
 fn lessThanNumericString(_: void, lhs: []const u8, rhs: []const u8) bool {
     return (std.fmt.parseInt(usize, lhs, 10) catch 0) < (std.fmt.parseInt(usize, rhs, 10) catch 0);
 }
@@ -4453,7 +4626,7 @@ fn readMetaValueAlloc(allocator: std.mem.Allocator, path: []const u8, key: []con
     return try allocator.dupe(u8, "");
 }
 
-fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8, path: []const u8, ids: []const []const u8) !void {
+fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8, path: []const u8, ids: []const []const u8, profile: []const u8) !void {
     var client = try SkipdClient.connect(socket_path);
     defer client.deinit();
 
@@ -4476,6 +4649,7 @@ fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8,
     const content = try std.fmt.allocPrint(allocator,
         "cache_rev=1\n" ++
             "gen_rev=20260326_6\n" ++
+            "profile={s}\n" ++
             "linux_ver={s}\n" ++
             "ss_basic_tfo={s}\n" ++
             "server_resolv_mode={s}\n" ++
@@ -4485,6 +4659,7 @@ fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8,
             "xray_ids_md5={s}\n" ++
             "built_at={d}\n",
         .{
+            profile,
             linux_ver,
             if (tfo.len > 0) tfo else "0",
             if (std.mem.eql(u8, resolv_mode_raw, "2")) "2" else "1",
@@ -5522,6 +5697,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool dedupe [options]\n" ++
         "  node-tool compact-ids [options]\n" ++
         "  node-tool warm-cache [options]\n" ++
+        "  node-tool runtime-artifact [options]\n" ++
         "  node-tool reorder [options]\n" ++
         "  node-tool plan [options]\n" ++
         "  node-tool version\n",
@@ -5547,6 +5723,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .dedupe => try writer.writeAll("Usage: node-tool dedupe [--match identity|config|all] [--dry-run] [--socket path]\n"),
         .compact_ids => try writer.writeAll("Usage: node-tool compact-ids [--dry-run] [--socket path]\n"),
         .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
+        .runtime_artifact => try writer.writeAll("Usage: node-tool runtime-artifact --profile webtest|shunt --output-dir /tmp/fancyss_runtime [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
@@ -5575,6 +5752,24 @@ test "parse export-sources command" {
     try std.testing.expect(std.mem.eql(u8, options.query.output_dir.?, "/tmp/fancyss_subs"));
     try std.testing.expect(std.mem.eql(u8, options.query.meta_path.?, "/tmp/fancyss_subs/local_split_meta.tsv"));
     try std.testing.expect(std.mem.eql(u8, options.query.all_jsonl_path.?, "/tmp/fancyss_subs/ss_nodes_spl.txt"));
+}
+
+test "parse runtime artifact args" {
+    const args = [_][]const u8{
+        "node-tool",
+        "runtime-artifact",
+        "--profile",
+        "shunt",
+        "--output-dir",
+        "/tmp/fancyss_runtime",
+        "--ids-file",
+        "/tmp/runtime_ids.txt",
+    };
+    const options = try parseArgs(&args);
+    try std.testing.expect(options.command == .runtime_artifact);
+    try std.testing.expect(std.mem.eql(u8, options.query.profile.?, "shunt"));
+    try std.testing.expect(std.mem.eql(u8, options.query.output_dir.?, "/tmp/fancyss_runtime"));
+    try std.testing.expect(std.mem.eql(u8, options.query.ids_file.?, "/tmp/runtime_ids.txt"));
 }
 
 test "parse json2node plan output args" {
