@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.0";
+const app_version = "0.1.1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
