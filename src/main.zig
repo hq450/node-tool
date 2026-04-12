@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const app_version = "0.1.1";
+const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
@@ -3687,7 +3688,7 @@ fn webtestGlobalMetaMatches(allocator: std.mem.Allocator, socket_path: []const u
     defer allocator.free(expected_count);
 
     return std.mem.eql(u8, cache_rev, "1") and
-        std.mem.eql(u8, gen_rev, "20260326_6") and
+        std.mem.eql(u8, gen_rev, webtest_cache_gen_rev) and
         std.mem.eql(u8, linux_ver, current_linux_ver) and
         std.mem.eql(u8, cache_tfo, expected_tfo) and
         std.mem.eql(u8, cache_resolv_mode, expected_resolv_mode) and
@@ -4732,6 +4733,8 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     const pass = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_pass");
     defer if (pass) |value| allocator.free(value);
     if (pass == null or pass.?.len == 0) return false;
+    const hy2_port = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_port");
+    defer if (hy2_port) |value| allocator.free(value);
     const up = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_up");
     defer if (up) |value| allocator.free(value);
     const dl = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_dl");
@@ -4758,6 +4761,18 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     defer allocator.free(out_path);
     const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
     defer allocator.free(meta_path);
+    const hy2_port_value = if (hy2_port != null and hy2_port.?.len > 0) hy2_port.? else node.port;
+    const has_port_range = std.mem.indexOfScalar(u8, hy2_port_value, ',') != null or std.mem.indexOfScalar(u8, hy2_port_value, '-') != null;
+    const settings_port_literal = if (has_port_range)
+        try allocator.dupe(u8, "null")
+    else
+        try allocator.dupe(u8, hy2_port_value);
+    defer allocator.free(settings_port_literal);
+    const udphop_port_literal = if (has_port_range)
+        try std.fmt.allocPrint(allocator, "\"{s}\"", .{hy2_port_value})
+    else
+        try allocator.dupe(u8, "\"\"");
+    defer allocator.free(udphop_port_literal);
     const up_value = if (up) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
     defer allocator.free(up_value);
     const dl_value = if (dl) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
@@ -4774,7 +4789,7 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
             "  \"settings\": {{\"version\": 2, \"address\": \"{s}\", \"port\": {s}}},\n" ++
             "  \"streamSettings\": {{\n" ++
             "    \"network\": \"hysteria\",\n" ++
-            "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\", \"congestion\": \"{s}\", \"up\": \"{s}\", \"down\": \"{s}\", \"udphop\": {{\"port\": \"\", \"interval\": 30}}}},\n" ++
+            "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\", \"congestion\": \"{s}\", \"up\": \"{s}\", \"down\": \"{s}\", \"udphop\": {{\"port\": {s}, \"interval\": 30}}}},\n" ++
             "    \"security\": \"tls\",\n" ++
             "    \"tlsSettings\": {{\"serverName\": \"{s}\", \"pinnedPeerCertSha256\": \"{s}\", \"verifyPeerCertByName\": \"{s}\", \"allowInsecure\": {s}, \"alpn\": [\"h3\"]}},\n" ++
             "    \"sockopt\": {{\"tcpFastOpen\": {s}}}{s}\n" ++
@@ -4783,11 +4798,12 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
         .{
             node.id,
             node.server,
-            node.port,
+            settings_port_literal,
             pass.?,
             if (cg) |value| value else "bbr",
             up_value,
             dl_value,
+            udphop_port_literal,
             if (sni) |value| value else node.server,
             if (pcs) |value| value else "",
             if (vcn) |value| value else "",
@@ -4897,7 +4913,7 @@ fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8,
 
     const content = try std.fmt.allocPrint(allocator,
         "cache_rev=1\n" ++
-            "gen_rev=20260326_6\n" ++
+            "gen_rev=" ++ webtest_cache_gen_rev ++ "\n" ++
             "profile={s}\n" ++
             "linux_ver={s}\n" ++
             "ss_basic_tfo={s}\n" ++
