@@ -59,6 +59,7 @@ const QueryOptions = struct {
     source: ?[]const u8 = null,
     source_tag: ?[]const u8 = null,
     profile_id: ?[]const u8 = null,
+    effective: bool = false,
     airport_identity: ?[]const u8 = null,
     group: ?[]const u8 = null,
     protocol: ?[]const u8 = null,
@@ -100,6 +101,15 @@ const DbPair = struct {
     fn deinit(self: *DbPair, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
         allocator.free(self.value);
+    }
+};
+
+const ProfileState = struct {
+    id: []u8,
+    enabled: bool,
+
+    fn deinit(self: *ProfileState, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
     }
 };
 
@@ -258,6 +268,9 @@ const NodeJson = struct {
     naive_port: ?[]const u8 = null,
     hy2_server: ?[]const u8 = null,
     hy2_port: ?[]const u8 = null,
+    server_ip: ?[]const u8 = null,
+    latency: ?[]const u8 = null,
+    ping: ?[]const u8 = null,
 };
 
 const NodeRecord = struct {
@@ -278,6 +291,9 @@ const NodeRecord = struct {
     identity_secondary: []u8,
     server: []u8,
     port: []u8,
+    server_ip: []u8,
+    latency: []u8,
+    ping: []u8,
     schema: u64,
     rev: u64,
     created_at: u64,
@@ -302,6 +318,9 @@ const NodeRecord = struct {
         allocator.free(self.identity_secondary);
         allocator.free(self.server);
         allocator.free(self.port);
+        allocator.free(self.server_ip);
+        allocator.free(self.latency);
+        allocator.free(self.ping);
         allocator.free(self.raw_json);
     }
 };
@@ -716,6 +735,8 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.profile_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--effective")) {
+            query.effective = true;
         } else if (std.mem.eql(u8, arg, "--airport-identity")) {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
@@ -1278,6 +1299,9 @@ fn runSyncSource(allocator: std.mem.Allocator, state: *SchemaState, query: Query
             .identity_secondary = try allocator.dupe(u8, node.identity_secondary),
             .server = try allocator.dupe(u8, node.server),
             .port = try allocator.dupe(u8, node.port),
+            .server_ip = try allocator.dupe(u8, node.server_ip),
+            .latency = try allocator.dupe(u8, node.latency),
+            .ping = try allocator.dupe(u8, node.ping),
             .schema = node.schema,
             .rev = node.rev,
             .created_at = node.created_at,
@@ -2035,6 +2059,9 @@ fn cloneNodeSlice(allocator: std.mem.Allocator, nodes: []const NodeRecord) ![]No
             .identity_secondary = try allocator.dupe(u8, node.identity_secondary),
             .server = try allocator.dupe(u8, node.server),
             .port = try allocator.dupe(u8, node.port),
+            .server_ip = try allocator.dupe(u8, node.server_ip),
+            .latency = try allocator.dupe(u8, node.latency),
+            .ping = try allocator.dupe(u8, node.ping),
             .schema = node.schema,
             .rev = node.rev,
             .created_at = node.created_at,
@@ -5058,6 +5085,9 @@ fn parseNodeRecordFromDecodedOwnedJson(allocator: std.mem.Allocator, owned_json:
         .identity_secondary = try allocator.dupe(u8, value._identity_secondary orelse ""),
         .server = try allocator.dupe(u8, endpoint.server),
         .port = try allocator.dupe(u8, endpoint.port),
+        .server_ip = try allocator.dupe(u8, value.server_ip orelse ""),
+        .latency = try allocator.dupe(u8, value.latency orelse ""),
+        .ping = try allocator.dupe(u8, value.ping orelse ""),
         .schema = value._schema orelse 0,
         .rev = value._rev orelse 0,
         .created_at = value._created_at orelse 0,
@@ -5376,6 +5406,51 @@ fn bumpStatItem(allocator: std.mem.Allocator, items: *std.ArrayList(StatItem), k
     });
 }
 
+fn loadProfileStatesAlloc(allocator: std.mem.Allocator) ![]ProfileState {
+    const runtime_path = "/tmp/upload/ss_subscribe_profiles.json";
+    const file = std.fs.openFileAbsolute(runtime_path, .{}) catch return try allocator.alloc(ProfileState, 0);
+    defer file.close();
+    const contents = try file.readToEndAlloc(allocator, max_skipd_frame);
+    defer allocator.free(contents);
+    if (contents.len == 0) return try allocator.alloc(ProfileState, 0);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, contents, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try allocator.alloc(ProfileState, 0);
+    const items = parsed.value.object.get("items") orelse return try allocator.alloc(ProfileState, 0);
+    if (items != .array) return try allocator.alloc(ProfileState, 0);
+
+    var out = std.ArrayList(ProfileState){};
+    errdefer {
+        for (out.items) |*item| item.deinit(allocator);
+        out.deinit(allocator);
+    }
+    for (items.array.items) |item| {
+        if (item != .object) continue;
+        const id_value = item.object.get("id") orelse continue;
+        const enabled_value = item.object.get("enabled") orelse continue;
+        if (id_value != .string or enabled_value != .bool) continue;
+        try out.append(allocator, .{
+            .id = try allocator.dupe(u8, id_value.string),
+            .enabled = enabled_value.bool,
+        });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn freeProfileStates(allocator: std.mem.Allocator, items: []ProfileState) void {
+    for (items) |*item| item.deinit(allocator);
+    allocator.free(items);
+}
+
+fn profileEnabled(profile_states: []const ProfileState, profile_id: []const u8) bool {
+    if (profile_id.len == 0) return true;
+    for (profile_states) |item| {
+        if (std.mem.eql(u8, item.id, profile_id)) return item.enabled;
+    }
+    return true;
+}
+
 fn filterNodeSliceInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, query: QueryOptions) !void {
     const source_value = query.source orelse "";
     const source_tag_value = query.source_tag orelse "";
@@ -5386,6 +5461,8 @@ fn filterNodeSliceInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, qu
     const name_value = query.name orelse "";
     const identity_value = query.identity orelse "";
     const ids_csv_value = query.ids_csv orelse "";
+    const profile_states = if (query.effective) try loadProfileStatesAlloc(allocator) else try allocator.alloc(ProfileState, 0);
+    defer freeProfileStates(allocator, profile_states);
 
     var kept = std.ArrayList(NodeRecord){};
     errdefer kept.deinit(allocator);
@@ -5400,6 +5477,7 @@ fn filterNodeSliceInPlace(allocator: std.mem.Allocator, nodes: *[]NodeRecord, qu
         if (!matchOptionalExactCaseFold(protocol_value, node.protocol)) continue;
         if (!matchOptionalExact(identity_value, node.identity)) continue;
         if (!matchOptionalSubstringCaseFold(name_value, node.name)) continue;
+        if (query.effective and !profileEnabled(profile_states, node.profile_id)) continue;
         try kept.append(allocator, node);
     }
 
@@ -5890,6 +5968,12 @@ fn renderNodeViewJsonAlloc(allocator: std.mem.Allocator, node: NodeRecord) ![]u8
     try writeJsonString(writer, node.server);
     try writer.writeAll(",\"port\":");
     try writeJsonString(writer, node.port);
+    try writer.writeAll(",\"server_ip\":");
+    try writeJsonString(writer, node.server_ip);
+    try writer.writeAll(",\"latency\":");
+    try writeJsonString(writer, node.latency);
+    try writer.writeAll(",\"ping\":");
+    try writeJsonString(writer, node.ping);
     try writer.writeAll(",\"identity\":");
     try writeJsonString(writer, node.identity);
     try writer.writeAll("}");
@@ -5993,14 +6077,14 @@ fn printUsage(writer: anytype) !void {
 
 fn printCommandUsage(command: Command, writer: anytype) !void {
     switch (command) {
-        .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
-        .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
+        .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
+        .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--profile-id value] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
         .airport_domains => try writer.writeAll("Usage: node-tool airport-domains [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
         .prune_export_sources => try writer.writeAll("Usage: node-tool prune-export-sources --meta /tmp/fancyss_subs/local_split_meta.tsv --active-source-tags /tmp/fancyss_subs/active_source_tags.txt [--format text|json|shell]\n"),
-        .webtest_groups => try writer.writeAll("Usage: node-tool webtest-groups --output-dir /tmp/fancyss_webtest [--ids 1,2,3 | --ids-file /tmp/ids.txt | --source user|subscribe | --source-tag tag | --profile-id value | --airport-identity value | --group name | --protocol type | --name keyword | --identity value] [--socket path]\n"),
+        .webtest_groups => try writer.writeAll("Usage: node-tool webtest-groups --output-dir /tmp/fancyss_webtest [--ids 1,2,3 | --ids-file /tmp/ids.txt | --source user|subscribe | --source-tag tag | --profile-id value | --effective | --airport-identity value | --group name | --protocol type | --name keyword | --identity value] [--socket path]\n"),
         .node2json => try writer.writeAll("Usage: node-tool node2json [--schema2] [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--name keyword] [--identity value] [--format json|jsonl] [--canonical] [--socket path]\n"),
         .sync_source => try writer.writeAll("Usage: node-tool sync-source --source-tag tag [--input nodes.jsonl | --stdin] [--reuse-ids] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
         .json2node => try writer.writeAll("Usage: node-tool json2node [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--normalized-output file] [--plan-output file] [--plan-format shell|json|text] [--dry-run] [--socket path]\n"),
@@ -6009,8 +6093,8 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .delete_nodes => try writer.writeAll("Usage: node-tool delete-nodes [--ids 1,2,3 | --identity xxx_yyy | --name keyword | --source-tag tag | --profile-id value | --source user|subscribe | --group name | --airport-identity value | --protocol type | --all-subscribe | --all] [--dry-run] [--socket path]\n"),
         .dedupe => try writer.writeAll("Usage: node-tool dedupe [--match identity|config|all] [--dry-run] [--socket path]\n"),
         .compact_ids => try writer.writeAll("Usage: node-tool compact-ids [--dry-run] [--socket path]\n"),
-        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
-        .runtime_artifact => try writer.writeAll("Usage: node-tool runtime-artifact --profile webtest|shunt --output-dir /tmp/fancyss_runtime [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
+        .warm_cache => try writer.writeAll("Usage: node-tool warm-cache [--env] [--json] [--direct-domains] [--webtest] [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
+        .runtime_artifact => try writer.writeAll("Usage: node-tool runtime-artifact --profile webtest|shunt --output-dir /tmp/fancyss_runtime [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
