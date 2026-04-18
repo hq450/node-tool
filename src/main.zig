@@ -5317,6 +5317,7 @@ fn shouldSkipSecondaryKey(key: []const u8) bool {
         std.mem.eql(u8, key, "_created_at") or
         std.mem.eql(u8, key, "_migrated_from") or
         std.mem.eql(u8, key, "_b64_mode") or
+        std.mem.eql(u8, key, "_profile_id") or
         std.mem.eql(u8, key, "_airport_identity") or
         std.mem.eql(u8, key, "_source_scope") or
         std.mem.eql(u8, key, "_source_url_hash") or
