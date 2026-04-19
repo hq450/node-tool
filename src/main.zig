@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.3";
+const app_version = "0.1.4";
 const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -11,6 +11,7 @@ const Command = enum {
     list,
     stat,
     find,
+    current_env,
     airport_domains,
     find_duplicates,
     export_sources,
@@ -77,6 +78,7 @@ const QueryOptions = struct {
     normalized_output: ?[]const u8 = null,
     plan_output: ?[]const u8 = null,
     plan_format: ?[]const u8 = null,
+    fields: ?[]const u8 = null,
     position: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     canonical: bool = false,
@@ -616,6 +618,21 @@ fn run() !void {
 
     const options = try parseArgs(args);
     switch (options.command) {
+        .current_env => {
+            if (resolveCurrentEnvDirectId(options.query)) |node_id| {
+                var node = try loadSchema2NodeById(allocator, options.query.socket_path, node_id);
+                defer node.deinit(allocator);
+                try runCurrentEnvSingle(allocator, node.id, node.raw_json, options.query);
+            } else {
+                var nodes = try loadSchema2Nodes(allocator, options.query.socket_path);
+                defer freeNodeSlice(allocator, nodes);
+                try filterNodeSliceInPlace(allocator, &nodes, options.query);
+                if (options.query.ids_file) |ids_file| {
+                    try filterNodeSliceByIdsFileInPlace(allocator, &nodes, ids_file);
+                }
+                try runCurrentEnv(allocator, nodes, options.query);
+            }
+        },
         .version => {
             try std.fs.File.stdout().writeAll(app_version);
             try std.fs.File.stdout().writeAll("\n");
@@ -691,6 +708,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "list")) break :blk Command.list;
         if (std.mem.eql(u8, args[1], "stat")) break :blk Command.stat;
         if (std.mem.eql(u8, args[1], "find")) break :blk Command.find;
+        if (std.mem.eql(u8, args[1], "current-env")) break :blk Command.current_env;
         if (std.mem.eql(u8, args[1], "airport-domains")) break :blk Command.airport_domains;
         if (std.mem.eql(u8, args[1], "find-duplicates")) break :blk Command.find_duplicates;
         if (std.mem.eql(u8, args[1], "export-sources")) break :blk Command.export_sources;
@@ -805,6 +823,10 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.InvalidArguments;
             query.plan_format = args[i];
+        } else if (std.mem.eql(u8, arg, "--fields")) {
+            i += 1;
+            if (i >= args.len) return error.InvalidArguments;
+            query.fields = args[i];
         } else if (std.mem.eql(u8, arg, "--stdin")) {
             query.stdin_input = true;
         } else if (std.mem.eql(u8, arg, "--position")) {
@@ -872,6 +894,48 @@ fn runFind(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOption
         .jsonl => try writeListJson(allocator, std.fs.File.stdout().deprecatedWriter(), nodes, true),
         else => unreachable,
     }
+}
+
+fn runCurrentEnv(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOptions) !void {
+    if (nodes.len == 0) return error.InvalidArguments;
+    const node = nodes[0];
+    try runCurrentEnvSingle(allocator, node.id, node.raw_json, query);
+}
+
+fn runCurrentEnvSingle(allocator: std.mem.Allocator, node_id: []const u8, raw_json: []const u8, query: QueryOptions) !void {
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    const rendered = try renderFancyssNodeEnvAlloc(allocator, node_id, raw_json, query.fields);
+    defer allocator.free(rendered);
+    try stdout.writeAll(rendered);
+}
+
+fn resolveCurrentEnvDirectId(query: QueryOptions) ?[]const u8 {
+    if (query.source != null or
+        query.source_tag != null or
+        query.profile_id != null or
+        query.effective or
+        query.airport_identity != null or
+        query.group != null or
+        query.protocol != null or
+        query.name != null or
+        query.identity != null or
+        query.ids_file != null or
+        query.all or
+        query.all_subscribe)
+    {
+        return null;
+    }
+    const ids_csv = query.ids_csv orelse return null;
+    var it = std.mem.splitScalar(u8, ids_csv, ',');
+    const first = std.mem.trim(u8, it.next() orelse return null, " \t\r\n");
+    if (first.len == 0) return null;
+    if (it.next()) |rest| {
+        if (std.mem.trim(u8, rest, " \t\r\n").len > 0) return null;
+        while (it.next()) |more| {
+            if (std.mem.trim(u8, more, " \t\r\n").len > 0) return null;
+        }
+    }
+    return first;
 }
 
 fn runAirportDomains(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOptions) !void {
@@ -1722,6 +1786,24 @@ fn loadSchema2Nodes(allocator: std.mem.Allocator, socket_path: []const u8) ![]No
     }
 
     return try reorderNodeRecordsAlloc(allocator, nodes.items, order_csv);
+}
+
+fn loadSchema2NodeById(allocator: std.mem.Allocator, socket_path: []const u8, node_id: []const u8) !NodeRecord {
+    var client = try SkipdClient.connect(socket_path);
+    defer client.deinit();
+
+    const schema_value = try client.getAlloc(allocator, "fss_data_schema");
+    defer if (schema_value) |value| allocator.free(value);
+    if (schema_value == null or !std.mem.eql(u8, schema_value.?, "2")) {
+        return error.UnsupportedSchema;
+    }
+
+    const key = try std.fmt.allocPrint(allocator, "fss_node_{s}", .{node_id});
+    defer allocator.free(key);
+    const encoded_value = try client.getAlloc(allocator, key);
+    defer if (encoded_value) |value| allocator.free(value);
+    if (encoded_value == null) return error.InvalidArguments;
+    return parseNodeRecord(allocator, key, encoded_value.?);
 }
 
 fn loadSchema2State(allocator: std.mem.Allocator, socket_path: []const u8) !SchemaState {
@@ -3227,6 +3309,144 @@ fn renderNodeEnvAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]u8 
         try writer.print("WTN_{s}={s}\n", .{ key, quoted });
     }
     return try out.toOwnedSlice(allocator);
+}
+
+const FancyssEnvField = struct {
+    export_name: []const u8,
+    store_name: []const u8,
+};
+
+fn renderFancyssNodeEnvAlloc(allocator: std.mem.Allocator, node_id: []const u8, raw_json: []const u8, fields_csv: ?[]const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidArguments;
+
+    const source = if (parsed.value.object.get("_source")) |value|
+        try jsonValueToPlainStringAlloc(allocator, value)
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(source);
+    const b64_mode = if (parsed.value.object.get("_b64_mode")) |value|
+        try jsonValueToPlainStringAlloc(allocator, value)
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(b64_mode);
+
+    var fields = std.ArrayList(FancyssEnvField){};
+    defer fields.deinit(allocator);
+
+    if (fields_csv) |csv| {
+        var it = std.mem.tokenizeAny(u8, csv, ", \t\r\n");
+        while (it.next()) |field| {
+            try fields.append(allocator, .{
+                .export_name = try allocator.dupe(u8, field),
+                .store_name = try allocator.dupe(u8, fancyssResolveStoreField(field)),
+            });
+        }
+    } else {
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.*.len == 0) continue;
+            if (entry.key_ptr.*[0] == '_') continue;
+            if (entry.value_ptr.* == .null) continue;
+            try fields.append(allocator, .{
+                .export_name = try allocator.dupe(u8, entry.key_ptr.*),
+                .store_name = try allocator.dupe(u8, fancyssResolveStoreField(entry.key_ptr.*)),
+            });
+        }
+        std.mem.sort(FancyssEnvField, fields.items, {}, lessThanFancyssEnvField);
+    }
+    defer for (fields.items) |field| {
+        allocator.free(field.export_name);
+        allocator.free(field.store_name);
+    };
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+
+    const node_id_quoted = try shellQuoteAlloc(allocator, node_id);
+    defer allocator.free(node_id_quoted);
+    try writer.print("export FSS_NODE_CURRENT_ID={s}\n", .{node_id_quoted});
+    try writer.print("export ssconf_basic_node={s}\n", .{node_id_quoted});
+
+    for (fields.items) |field| {
+        const raw_value = parsed.value.object.get(field.store_name) orelse continue;
+        if (raw_value == .null) continue;
+
+        var plain = try jsonValueToPlainStringAlloc(allocator, raw_value);
+        defer allocator.free(plain);
+        if (plain.len == 0) continue;
+
+        if (fancyssIsB64Field(field.store_name)) {
+            if (!std.mem.eql(u8, b64_mode, "raw") and std.mem.eql(u8, source, "subscribe")) {
+                const decoded = try base64DecodeOrDupAlloc(allocator, plain);
+                allocator.free(plain);
+                plain = decoded;
+            }
+            if (fancyssNeedsCompactJson(field.store_name)) {
+                const compacted = try compactJsonStringOrDupAlloc(allocator, plain);
+                defer allocator.free(compacted);
+                const encoded = try base64EncodeAlloc(allocator, compacted);
+                allocator.free(plain);
+                plain = encoded;
+            }
+        }
+
+        const quoted = try shellQuoteAlloc(allocator, plain);
+        defer allocator.free(quoted);
+        try writer.print("export ss_basic_{s}={s}\n", .{ field.export_name, quoted });
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn lessThanFancyssEnvField(_: void, lhs: FancyssEnvField, rhs: FancyssEnvField) bool {
+    return std.mem.lessThan(u8, lhs.export_name, rhs.export_name);
+}
+
+fn fancyssResolveStoreField(field: []const u8) []const u8 {
+    if (std.mem.eql(u8, field, "xray_svn")) return "xray_vcn";
+    if (std.mem.eql(u8, field, "hy2_svn")) return "hy2_vcn";
+    return field;
+}
+
+fn fancyssIsB64Field(field: []const u8) bool {
+    return std.mem.eql(u8, field, "password") or
+        std.mem.eql(u8, field, "naive_pass") or
+        std.mem.eql(u8, field, "v2ray_json") or
+        std.mem.eql(u8, field, "xray_json") or
+        std.mem.eql(u8, field, "tuic_json");
+}
+
+fn fancyssNeedsCompactJson(field: []const u8) bool {
+    return std.mem.eql(u8, field, "v2ray_json") or
+        std.mem.eql(u8, field, "xray_json") or
+        std.mem.eql(u8, field, "tuic_json");
+}
+
+fn base64DecodeOrDupAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(input) catch return allocator.dupe(u8, input);
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    std.base64.standard.Decoder.decode(out, input) catch {
+        allocator.free(out);
+        return allocator.dupe(u8, input);
+    };
+    return out;
+}
+
+fn base64EncodeAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const size = std.base64.standard.Encoder.calcSize(input.len);
+    const out = try allocator.alloc(u8, size);
+    _ = std.base64.standard.Encoder.encode(out, input);
+    return out;
+}
+
+fn compactJsonStringOrDupAlloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, input, .{}) catch return allocator.dupe(u8, input);
+    defer parsed.deinit();
+    return renderCompactJsonAlloc(allocator, parsed.value);
 }
 
 fn jsonValueToPlainStringAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -6055,6 +6275,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool list [options]\n" ++
         "  node-tool stat [options]\n" ++
         "  node-tool find [options]\n" ++
+        "  node-tool current-env [options]\n" ++
         "  node-tool airport-domains [options]\n" ++
         "  node-tool find-duplicates [options]\n" ++
         "  node-tool export-sources [options]\n" ++
@@ -6081,6 +6302,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
         .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--profile-id value] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
+        .current_env => try writer.writeAll("Usage: node-tool current-env [--ids 23 | --identity xxx_yyy] [--fields name,type,server] [--socket path]\n"),
         .airport_domains => try writer.writeAll("Usage: node-tool airport-domains [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
         .find_duplicates => try writer.writeAll("Usage: node-tool find-duplicates [--match identity|config|all] [--format text|json|shell] [--socket path]\n"),
         .export_sources => try writer.writeAll("Usage: node-tool export-sources --output-dir /tmp/fancyss_subs --meta /tmp/fancyss_subs/local_split_meta.tsv [--all-jsonl /tmp/fancyss_subs/ss_nodes_spl.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json|shell] [--socket path]\n"),
@@ -6124,6 +6346,21 @@ test "parse export-sources command" {
     try std.testing.expect(std.mem.eql(u8, options.query.output_dir.?, "/tmp/fancyss_subs"));
     try std.testing.expect(std.mem.eql(u8, options.query.meta_path.?, "/tmp/fancyss_subs/local_split_meta.tsv"));
     try std.testing.expect(std.mem.eql(u8, options.query.all_jsonl_path.?, "/tmp/fancyss_subs/ss_nodes_spl.txt"));
+}
+
+test "parse current-env args" {
+    const args = [_][]const u8{
+        "node-tool",
+        "current-env",
+        "--ids",
+        "23",
+        "--fields",
+        "name,type,server",
+    };
+    const options = try parseArgs(&args);
+    try std.testing.expect(options.command == .current_env);
+    try std.testing.expect(std.mem.eql(u8, options.query.ids_csv.?, "23"));
+    try std.testing.expect(std.mem.eql(u8, options.query.fields.?, "name,type,server"));
 }
 
 test "parse runtime artifact args" {

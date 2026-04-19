@@ -28,7 +28,7 @@
 
 ## 当前版本
 
-`0.1.1`
+`0.1.4`
 
 当前代码按 Zig `0.15.2` 编写并验证。
 
@@ -38,6 +38,7 @@
 node-tool list
 node-tool stat
 node-tool find
+node-tool current-env
 node-tool find-duplicates
 node-tool node2json
 node-tool json2node
