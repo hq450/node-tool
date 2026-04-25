@@ -1,11 +1,12 @@
 const std = @import("std");
 
-const app_version = "0.1.4";
+const app_version = "0.1.5";
 const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
 const max_skipd_frame = 16 * 1024 * 1024;
+var posix_cksum_table: ?[256]u32 = null;
 
 const Command = enum {
     list,
@@ -29,6 +30,7 @@ const Command = enum {
     runtime_artifact,
     reorder,
     plan,
+    migrate_legacy,
     version,
 };
 
@@ -586,6 +588,22 @@ const DuplicateSummary = struct {
     }
 };
 
+const LegacyNodeDraft = struct {
+    id: []const u8,
+    numeric_id: usize,
+    fields: std.json.ObjectMap,
+    has_name: bool = false,
+};
+
+const SourceMetaRow = struct {
+    tag: []const u8,
+    profile_id: []const u8,
+    airport_identity: []const u8,
+    source_scope: []const u8,
+    url_hash: []const u8,
+    group_label: []const u8,
+};
+
 pub fn main() void {
     run() catch |err| {
         const stderr = std.fs.File.stderr().deprecatedWriter();
@@ -636,6 +654,9 @@ fn run() !void {
         .version => {
             try std.fs.File.stdout().writeAll(app_version);
             try std.fs.File.stdout().writeAll("\n");
+        },
+        .migrate_legacy => {
+            try runMigrateLegacy(allocator, options.query);
         },
         .prune_export_sources => {
             try runPruneExportSources(allocator, options.query);
@@ -726,6 +747,7 @@ fn parseArgs(args: []const []const u8) !Options {
         if (std.mem.eql(u8, args[1], "runtime-artifact")) break :blk Command.runtime_artifact;
         if (std.mem.eql(u8, args[1], "reorder")) break :blk Command.reorder;
         if (std.mem.eql(u8, args[1], "plan")) break :blk Command.plan;
+        if (std.mem.eql(u8, args[1], "migrate-legacy")) break :blk Command.migrate_legacy;
         if (std.mem.eql(u8, args[1], "version")) break :blk Command.version;
         return error.InvalidArguments;
     };
@@ -1753,6 +1775,345 @@ fn resolveAirportDomainsFormat(raw: ?[]const u8) !OutputFormat {
     if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
     if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
     return error.InvalidArguments;
+}
+
+fn runMigrateLegacy(allocator: std.mem.Allocator, query: QueryOptions) !void {
+    const old_nodes = try allocator.alloc(NodeRecord, 0);
+    defer allocator.free(old_nodes);
+
+    var client = try SkipdClient.connect(query.socket_path);
+    defer client.deinit();
+
+    const current_value = try client.getAlloc(allocator, "ssconf_basic_node");
+    defer if (current_value) |value| allocator.free(value);
+    const failover_value = try client.getAlloc(allocator, "ss_failover_s4_3");
+    defer if (failover_value) |value| allocator.free(value);
+
+    const pairs = try client.listAlloc(allocator, "ssconf_basic_");
+    defer {
+        for (pairs) |*pair| pair.deinit(allocator);
+        allocator.free(pairs);
+    }
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const source_meta_rows = try loadSourceMetaRows(arena, query.meta_path);
+    var drafts = std.ArrayList(LegacyNodeDraft){};
+    errdefer drafts.deinit(arena);
+
+    for (pairs) |pair| {
+        const parsed = parseLegacyNodeKey(pair.key) orelse continue;
+        const draft_idx = try findOrCreateLegacyDraft(arena, &drafts, parsed.id);
+        var draft = &drafts.items[draft_idx];
+        try putLegacyField(arena, &draft.fields, parsed.field, pair.value);
+        if (std.mem.eql(u8, parsed.field, "name")) draft.has_name = true;
+    }
+
+    var nodes = std.ArrayList(NodeRecord){};
+    errdefer {
+        for (nodes.items) |*node| node.deinit(allocator);
+        nodes.deinit(allocator);
+    }
+
+    std.mem.sort(LegacyNodeDraft, drafts.items, {}, lessThanLegacyDraftId);
+
+    var max_id: usize = 0;
+    const ts = nowMs();
+    for (drafts.items) |*draft| {
+        if (!draft.has_name) continue;
+        if (draft.numeric_id > max_id) max_id = draft.numeric_id;
+
+        const raw_node = try buildLegacyNodeJsonAlloc(allocator, arena, draft, source_meta_rows, ts);
+        defer allocator.free(raw_node);
+        const normalized = try normalizeNodeJsonForWriteAlloc(allocator, raw_node, draft.id, null, null);
+        errdefer allocator.free(normalized);
+        try nodes.append(allocator, try parseNodeRecordFromDecodedOwnedJson(allocator, normalized, draft.id));
+    }
+
+    if (nodes.items.len == 0) return error.InvalidArguments;
+
+    const current_id = resolveLegacyReferenceId(nodes.items, if (current_value) |value| value else null, true);
+    const failover_id = resolveLegacyReferenceId(nodes.items, if (failover_value) |value| value else null, false);
+    var state = SchemaState{
+        .nodes = try nodes.toOwnedSlice(allocator),
+        .current_id = try allocator.dupe(u8, current_id),
+        .current_identity = try allocator.dupe(u8, ""),
+        .failover_id = try allocator.dupe(u8, failover_id),
+        .failover_identity = try allocator.dupe(u8, ""),
+        .next_id = max_id + 1,
+    };
+    defer state.deinit(allocator);
+
+    if (!query.dry_run) {
+        try clearSchema2NodeKeys(allocator, &client);
+        try writeSchema2State(allocator, query.socket_path, old_nodes, &state);
+        const next_id_str = try std.fmt.allocPrint(allocator, "{d}", .{state.next_id});
+        defer allocator.free(next_id_str);
+        try client.setValue(allocator, "fss_node_next_id", next_id_str);
+        try client.setValue(allocator, "fss_data_migrated", "1");
+        try client.setValue(allocator, "fss_data_secret_mode", "raw");
+    }
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("command: migrate-legacy\n", .{});
+    try stdout.print("dry_run: {s}\n", .{if (query.dry_run) "1" else "0"});
+    try stdout.print("migrated: {d}\n", .{state.nodes.len});
+    try stdout.print("current: {s}\n", .{state.current_id});
+    try stdout.print("failover: {s}\n", .{state.failover_id});
+    try stdout.print("next_id: {d}\n", .{state.next_id});
+}
+
+fn clearSchema2NodeKeys(allocator: std.mem.Allocator, client: *SkipdClient) !void {
+    const pairs = try client.listAlloc(allocator, "fss_node_");
+    defer {
+        for (pairs) |*pair| pair.deinit(allocator);
+        allocator.free(pairs);
+    }
+    for (pairs) |pair| {
+        try client.removeKey(allocator, pair.key);
+    }
+    try client.removeKey(allocator, "fss_node_order");
+    try client.removeKey(allocator, "fss_node_current");
+    try client.removeKey(allocator, "fss_node_current_identity");
+    try client.removeKey(allocator, "fss_node_failover_backup");
+    try client.removeKey(allocator, "fss_node_failover_identity");
+    try client.removeKey(allocator, "fss_current_node_identity");
+    try client.removeKey(allocator, "fss_failover_node_identity");
+}
+
+fn parseLegacyNodeKey(key: []const u8) ?struct { id: []const u8, field: []const u8 } {
+    if (!std.mem.startsWith(u8, key, "ssconf_basic_")) return null;
+    const rest = key["ssconf_basic_".len..];
+    const pos = std.mem.lastIndexOfScalar(u8, rest, '_') orelse return null;
+    const field = rest[0..pos];
+    const id = rest[pos + 1 ..];
+    if (field.len == 0 or id.len == 0) return null;
+    for (id) |ch| {
+        if (!std.ascii.isDigit(ch)) return null;
+    }
+    return .{ .id = id, .field = field };
+}
+
+fn findOrCreateLegacyDraft(allocator: std.mem.Allocator, drafts: *std.ArrayList(LegacyNodeDraft), id: []const u8) !usize {
+    for (drafts.items, 0..) |draft, idx| {
+        if (std.mem.eql(u8, draft.id, id)) return idx;
+    }
+    try drafts.append(allocator, .{
+        .id = try allocator.dupe(u8, id),
+        .numeric_id = std.fmt.parseInt(usize, id, 10) catch 0,
+        .fields = std.json.ObjectMap.init(allocator),
+    });
+    return drafts.items.len - 1;
+}
+
+fn putLegacyField(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, field: []const u8, raw_value: []const u8) !void {
+    if (raw_value.len == 0) return;
+    const value = if (isLegacyB64Field(field))
+        try decodeLegacyB64StringAlloc(allocator, field, raw_value)
+    else
+        try allocator.dupe(u8, raw_value);
+    try obj.put(field, .{ .string = value });
+}
+
+fn decodeLegacyB64StringAlloc(allocator: std.mem.Allocator, field: []const u8, raw_value: []const u8) ![]u8 {
+    const decoded = decodeBase64SmartAlloc(allocator, raw_value) catch return try allocator.dupe(u8, raw_value);
+    if (!isLegacyJsonB64Field(field)) return decoded;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch |err| switch (err) {
+        error.SyntaxError, error.UnexpectedEndOfInput => return decoded,
+        else => return err,
+    };
+    defer parsed.deinit();
+    allocator.free(decoded);
+    return try renderCompactJsonAlloc(allocator, parsed.value);
+}
+
+fn isLegacyB64Field(field: []const u8) bool {
+    return std.mem.eql(u8, field, "password") or
+        std.mem.eql(u8, field, "naive_pass") or
+        std.mem.eql(u8, field, "v2ray_json") or
+        std.mem.eql(u8, field, "xray_json") or
+        std.mem.eql(u8, field, "tuic_json");
+}
+
+fn isLegacyJsonB64Field(field: []const u8) bool {
+    return std.mem.eql(u8, field, "v2ray_json") or
+        std.mem.eql(u8, field, "xray_json") or
+        std.mem.eql(u8, field, "tuic_json");
+}
+
+fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocator, draft: *LegacyNodeDraft, source_meta_rows: []const SourceMetaRow, ts: u64) ![]u8 {
+    const node_type = try jsonGetStringAlloc(arena, &draft.fields, "type");
+    const group = try jsonGetStringAlloc(arena, &draft.fields, "group");
+
+    try normalizeLegacyBoolField(arena, &draft.fields, "v2ray_use_json");
+    try normalizeLegacyBoolField(arena, &draft.fields, "v2ray_mux_enable");
+    try normalizeLegacyBoolField(arena, &draft.fields, "v2ray_network_security_ai");
+    try normalizeLegacyBoolField(arena, &draft.fields, "v2ray_network_security_alpn_h2");
+    try normalizeLegacyBoolField(arena, &draft.fields, "v2ray_network_security_alpn_http");
+    try normalizeLegacyBoolField(arena, &draft.fields, "xray_use_json");
+    try normalizeLegacyBoolField(arena, &draft.fields, "xray_network_security_ai");
+    try normalizeLegacyBoolField(arena, &draft.fields, "xray_network_security_alpn_h2");
+    try normalizeLegacyBoolField(arena, &draft.fields, "xray_network_security_alpn_http");
+    try normalizeLegacyBoolField(arena, &draft.fields, "xray_show");
+    try normalizeLegacyBoolField(arena, &draft.fields, "trojan_ai");
+    try normalizeLegacyBoolField(arena, &draft.fields, "trojan_tfo");
+    try normalizeLegacyBoolField(arena, &draft.fields, "hy2_ai");
+    try normalizeLegacyBoolField(arena, &draft.fields, "hy2_tfo");
+
+    _ = draft.fields.orderedRemove("server_ip");
+    _ = draft.fields.orderedRemove("latency");
+    _ = draft.fields.orderedRemove("ping");
+    if (std.mem.eql(u8, node_type, "4")) {
+        const xray_prot = try jsonGetStringAlloc(arena, &draft.fields, "xray_prot");
+        if (xray_prot.len == 0) try jsonPutString(arena, &draft.fields, "xray_prot", "vless");
+    }
+
+    try pruneLegacyNodeFields(arena, &draft.fields, node_type);
+
+    const meta = findSourceMetaForGroup(group, source_meta_rows);
+    try jsonPutInteger(&draft.fields, "_schema", 2);
+    try jsonPutString(arena, &draft.fields, "_id", draft.id);
+    try jsonPutInteger(&draft.fields, "_rev", 1);
+    try jsonPutString(arena, &draft.fields, "_b64_mode", "raw");
+    if (meta) |row| {
+        try jsonPutString(arena, &draft.fields, "_source", "subscribe");
+        try jsonPutString(arena, &draft.fields, "_profile_id", row.profile_id);
+        try jsonPutString(arena, &draft.fields, "_airport_identity", row.airport_identity);
+        try jsonPutString(arena, &draft.fields, "_source_scope", row.source_scope);
+        try jsonPutString(arena, &draft.fields, "_source_url_hash", row.url_hash);
+    } else {
+        try jsonPutString(arena, &draft.fields, "_source", "migration");
+    }
+    try jsonPutInteger(&draft.fields, "_updated_at", @as(i64, @intCast(ts)));
+    try jsonPutInteger(&draft.fields, "_created_at", @as(i64, @intCast(ts)));
+    try jsonPutString(arena, &draft.fields, "_migrated_from", draft.id);
+
+    return try renderCompactJsonAlloc(allocator, .{ .object = draft.fields });
+}
+
+fn normalizeLegacyBoolField(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, field: []const u8) !void {
+    const value = try jsonGetStringAlloc(allocator, obj, field);
+    try jsonPutString(allocator, obj, field, if (std.mem.eql(u8, value, "1")) "1" else "0");
+}
+
+fn pruneLegacyNodeFields(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, node_type: []const u8) !void {
+    var remove_keys = std.ArrayList([]const u8){};
+    defer remove_keys.deinit(allocator);
+
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, key, "_") or keepLegacyCommonField(key) or keepLegacyTypeField(node_type, key)) continue;
+        try remove_keys.append(allocator, key);
+    }
+    for (remove_keys.items) |key| {
+        _ = obj.orderedRemove(key);
+    }
+}
+
+fn keepLegacyCommonField(key: []const u8) bool {
+    return std.mem.eql(u8, key, "group") or
+        std.mem.eql(u8, key, "name") or
+        std.mem.eql(u8, key, "mode") or
+        std.mem.eql(u8, key, "type");
+}
+
+fn keepLegacyTypeField(node_type: []const u8, key: []const u8) bool {
+    if (std.mem.eql(u8, node_type, "0")) {
+        return stringIn(key, &.{ "server", "port", "method", "password", "ss_obfs", "ss_obfs_host" });
+    }
+    if (std.mem.eql(u8, node_type, "1")) {
+        return stringIn(key, &.{ "server", "port", "method", "password", "rss_protocol", "rss_protocol_param", "rss_obfs", "rss_obfs_param" });
+    }
+    if (std.mem.eql(u8, node_type, "3")) {
+        return stringIn(key, &.{ "server", "port", "v2ray_uuid", "v2ray_alterid", "v2ray_security", "v2ray_network", "v2ray_headtype_tcp", "v2ray_headtype_kcp", "v2ray_kcp_seed", "v2ray_headtype_quic", "v2ray_grpc_mode", "v2ray_grpc_authority", "v2ray_network_path", "v2ray_network_host", "v2ray_network_security", "v2ray_network_security_ai", "v2ray_network_security_alpn_h2", "v2ray_network_security_alpn_http", "v2ray_network_security_sni", "v2ray_mux_concurrency", "v2ray_json", "v2ray_use_json", "v2ray_mux_enable" });
+    }
+    if (std.mem.eql(u8, node_type, "4")) {
+        return stringIn(key, &.{ "server", "port", "xray_uuid", "xray_alterid", "xray_prot", "xray_encryption", "xray_flow", "xray_network", "xray_headtype_tcp", "xray_headtype_kcp", "xray_kcp_seed", "xray_headtype_quic", "xray_grpc_mode", "xray_grpc_authority", "xray_xhttp_mode", "xray_network_path", "xray_network_host", "xray_network_security", "xray_network_security_ai", "xray_network_security_alpn_h2", "xray_network_security_alpn_http", "xray_network_security_sni", "xray_pcs", "xray_vcn", "xray_fingerprint", "xray_publickey", "xray_shortid", "xray_spiderx", "xray_show", "xray_json", "xray_use_json" });
+    }
+    if (std.mem.eql(u8, node_type, "5")) {
+        return stringIn(key, &.{ "server", "port", "trojan_ai", "trojan_uuid", "trojan_sni", "trojan_pcs", "trojan_vcn", "trojan_tfo", "trojan_plugin", "trojan_obfs", "trojan_obfshost", "trojan_obfsuri" });
+    }
+    if (std.mem.eql(u8, node_type, "6")) {
+        return stringIn(key, &.{ "naive_prot", "naive_server", "naive_port", "naive_user", "naive_pass" });
+    }
+    if (std.mem.eql(u8, node_type, "7")) {
+        return std.mem.eql(u8, key, "tuic_json");
+    }
+    if (std.mem.eql(u8, node_type, "8")) {
+        return stringIn(key, &.{ "hy2_server", "hy2_port", "hy2_pass", "hy2_up", "hy2_dl", "hy2_obfs", "hy2_obfs_pass", "hy2_sni", "hy2_pcs", "hy2_vcn", "hy2_ai", "hy2_tfo", "hy2_cg" });
+    }
+    return false;
+}
+
+fn stringIn(value: []const u8, items: []const []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, value, item)) return true;
+    }
+    return false;
+}
+
+fn loadSourceMetaRows(allocator: std.mem.Allocator, meta_path: ?[]const u8) ![]SourceMetaRow {
+    const path = meta_path orelse return try allocator.alloc(SourceMetaRow, 0);
+    const bytes = readInputCompatAlloc(allocator, path, false, max_skipd_frame) catch return try allocator.alloc(SourceMetaRow, 0);
+    defer allocator.free(bytes);
+
+    var rows = std.ArrayList(SourceMetaRow){};
+    errdefer rows.deinit(allocator);
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const tag = fields.next() orelse continue;
+        const profile_id = fields.next() orelse "";
+        const airport_identity = fields.next() orelse "";
+        const source_scope = fields.next() orelse "";
+        const url_hash = fields.next() orelse "";
+        const group_label = fields.next() orelse "";
+        if (tag.len == 0) continue;
+        try rows.append(allocator, .{
+            .tag = try allocator.dupe(u8, tag),
+            .profile_id = try allocator.dupe(u8, profile_id),
+            .airport_identity = try allocator.dupe(u8, airport_identity),
+            .source_scope = try allocator.dupe(u8, source_scope),
+            .url_hash = try allocator.dupe(u8, url_hash),
+            .group_label = try allocator.dupe(u8, group_label),
+        });
+    }
+    return try rows.toOwnedSlice(allocator);
+}
+
+fn findSourceMetaForGroup(group: []const u8, rows: []const SourceMetaRow) ?SourceMetaRow {
+    if (group.len == 0) return null;
+    if (splitGroupSuffix(group)) |parts| {
+        for (rows) |row| {
+            if (std.mem.eql(u8, row.tag, parts.suffix)) return row;
+        }
+        var group_match: ?SourceMetaRow = null;
+        var count: usize = 0;
+        for (rows) |row| {
+            if (row.group_label.len == 0 or !std.mem.eql(u8, row.group_label, parts.base)) continue;
+            group_match = row;
+            count += 1;
+        }
+        if (count == 1) return group_match;
+    }
+    return null;
+}
+
+fn resolveLegacyReferenceId(nodes: []const NodeRecord, candidate: ?[]const u8, fallback_first: bool) []const u8 {
+    if (candidate) |value| {
+        if (value.len > 0 and findNodeIndexById(nodes, value) != null) return value;
+    }
+    if (fallback_first and nodes.len > 0) return nodes[0].id;
+    return "";
+}
+
+fn lessThanLegacyDraftId(_: void, lhs: LegacyNodeDraft, rhs: LegacyNodeDraft) bool {
+    return lhs.numeric_id < rhs.numeric_id;
 }
 
 fn loadSchema2Nodes(allocator: std.mem.Allocator, socket_path: []const u8) ![]NodeRecord {
@@ -5552,21 +5913,39 @@ fn shouldSkipSecondaryKey(key: []const u8) bool {
 }
 
 fn hashShellStyleHex8Alloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    const cksum = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "sh", "-c", "printf '%s' \"$1\" | cksum", "sh", input },
-        .max_output_bytes = 4096,
-    }) catch return try md5Hex8Alloc(allocator, input);
-    defer allocator.free(cksum.stdout);
-    defer allocator.free(cksum.stderr);
-    if (cksum.term == .Exited and cksum.term.Exited == 0) {
-        var fields = std.mem.tokenizeAny(u8, cksum.stdout, " \t\r\n");
-        if (fields.next()) |crc_dec| {
-            const value = std.fmt.parseInt(u32, crc_dec, 10) catch return try md5Hex8Alloc(allocator, input);
-            return try std.fmt.allocPrint(allocator, "{x:0>8}", .{value});
+    return try std.fmt.allocPrint(allocator, "{x:0>8}", .{posixCksum(input)});
+}
+
+fn makePosixCksumTable() [256]u32 {
+    const poly: u32 = 0x04C11DB7;
+    var table: [256]u32 = undefined;
+    for (&table, 0..) |*item, idx| {
+        var crc: u32 = @as(u32, @intCast(idx)) << 24;
+        var bit: usize = 0;
+        while (bit < 8) : (bit += 1) {
+            crc = if ((crc & 0x80000000) != 0) (crc << 1) ^ poly else crc << 1;
         }
+        item.* = crc;
     }
-    return try md5Hex8Alloc(allocator, input);
+    return table;
+}
+
+fn posixCksum(input: []const u8) u32 {
+    if (posix_cksum_table == null) {
+        posix_cksum_table = makePosixCksumTable();
+    }
+    const table = posix_cksum_table.?;
+    var crc: u32 = 0;
+    for (input) |byte| {
+        crc = (crc << 8) ^ table[((crc >> 24) ^ @as(u32, byte)) & 0xff];
+    }
+    var len = input.len;
+    while (len != 0) {
+        const byte = len & 0xff;
+        len >>= 8;
+        crc = (crc << 8) ^ table[((crc >> 24) ^ @as(u32, @intCast(byte))) & 0xff];
+    }
+    return ~crc;
 }
 
 fn md5Hex8Alloc(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -6293,6 +6672,7 @@ fn printUsage(writer: anytype) !void {
         "  node-tool runtime-artifact [options]\n" ++
         "  node-tool reorder [options]\n" ++
         "  node-tool plan [options]\n" ++
+        "  node-tool migrate-legacy [options]\n" ++
         "  node-tool version\n",
     );
 }
@@ -6320,6 +6700,7 @@ fn printCommandUsage(command: Command, writer: anytype) !void {
         .runtime_artifact => try writer.writeAll("Usage: node-tool runtime-artifact --profile webtest|shunt --output-dir /tmp/fancyss_runtime [--ids 1,2,3 | --ids-file /tmp/ids.txt] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--socket path]\n"),
         .reorder => try writer.writeAll("Usage: node-tool reorder [--ids 5,3,1 | --sort name|created|updated|id|protocol] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--dry-run] [--socket path]\n"),
         .plan => try writer.writeAll("Usage: node-tool plan [--input nodes.jsonl | --stdin] [--mode append|replace] [--reuse-ids] [--source user|subscribe] [--format json|text|shell] [--socket path]\n"),
+        .migrate_legacy => try writer.writeAll("Usage: node-tool migrate-legacy [--meta /tmp/legacy_subscribe_sources.tsv] [--dry-run] [--socket path]\n"),
         .version => try writer.writeAll("Usage: node-tool version\n"),
     }
 }
@@ -6328,6 +6709,13 @@ test "parse version command" {
     const args = [_][]const u8{ "node-tool", "version" };
     const options = try parseArgs(&args);
     try std.testing.expect(options.command == .version);
+}
+
+test "posix cksum matches shell cksum" {
+    try std.testing.expectEqual(@as(u32, 0xffffffff), posixCksum(""));
+    try std.testing.expectEqual(@as(u32, 1219131554), posixCksum("abc"));
+    try std.testing.expectEqual(@as(u32, 3287646509), posixCksum("hello"));
+    try std.testing.expectEqual(@as(u32, 930766865), posixCksum("123456789"));
 }
 
 test "parse export-sources command" {
