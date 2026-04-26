@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.7";
+const app_version = "0.1.8";
 const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -1984,6 +1984,7 @@ fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocat
     try normalizeLegacyBoolField(arena, &draft.fields, "trojan_tfo");
     try normalizeLegacyBoolField(arena, &draft.fields, "hy2_ai");
     try normalizeLegacyBoolField(arena, &draft.fields, "hy2_tfo");
+    try normalizeNodeDefaultFields(arena, &draft.fields);
 
     _ = draft.fields.orderedRemove("server_ip");
     _ = draft.fields.orderedRemove("latency");
@@ -2020,6 +2021,45 @@ fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocat
 fn normalizeLegacyBoolField(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, field: []const u8) !void {
     const value = try jsonGetStringAlloc(allocator, obj, field);
     try jsonPutString(allocator, obj, field, if (std.mem.eql(u8, value, "1")) "1" else "0");
+}
+
+fn normalizeLegacyDefaultField(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, field: []const u8, default_value: []const u8) !void {
+    const value = try jsonGetStringAlloc(allocator, obj, field);
+    if (value.len == 0) try jsonPutString(allocator, obj, field, default_value);
+}
+
+fn normalizeNodeDefaultFields(allocator: std.mem.Allocator, obj: *std.json.ObjectMap) !void {
+    const node_type = try jsonGetStringAlloc(allocator, obj, "type");
+    try normalizeLegacyDefaultField(allocator, obj, "mode", "2");
+    if (std.mem.eql(u8, node_type, "0")) {
+        try normalizeLegacyDefaultField(allocator, obj, "ss_obfs", "0");
+    } else if (std.mem.eql(u8, node_type, "1")) {
+        try normalizeLegacyDefaultField(allocator, obj, "rss_protocol", "origin");
+        try normalizeLegacyDefaultField(allocator, obj, "rss_obfs", "plain");
+    } else if (std.mem.eql(u8, node_type, "3")) {
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_alterid", "0");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_security", "auto");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_network", "tcp");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_headtype_tcp", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_headtype_kcp", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_headtype_quic", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_grpc_mode", "multi");
+        try normalizeLegacyDefaultField(allocator, obj, "v2ray_network_security", "none");
+    } else if (std.mem.eql(u8, node_type, "4")) {
+        try normalizeLegacyDefaultField(allocator, obj, "xray_alterid", "0");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_encryption", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_network", "tcp");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_headtype_tcp", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_headtype_kcp", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_headtype_quic", "none");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_grpc_mode", "gun");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_xhttp_mode", "auto");
+        try normalizeLegacyDefaultField(allocator, obj, "xray_network_security", "none");
+    } else if (std.mem.eql(u8, node_type, "6")) {
+        try normalizeLegacyDefaultField(allocator, obj, "naive_prot", "https");
+    } else if (std.mem.eql(u8, node_type, "8")) {
+        try normalizeLegacyDefaultField(allocator, obj, "hy2_obfs", "0");
+    }
 }
 
 fn pruneLegacyNodeFields(allocator: std.mem.Allocator, obj: *std.json.ObjectMap, node_type: []const u8) !void {
@@ -5744,6 +5784,7 @@ fn normalizeNodeJsonForWriteAlloc(allocator: std.mem.Allocator, raw_json: []cons
     if (source_override) |override| source = override;
     if (source.len == 0) source = "user";
     try normalizeLegacyB64Fields(arena, obj, if (source_override) |override| override else original_source);
+    try normalizeNodeDefaultFields(arena, obj);
 
     var airport_identity = try jsonGetStringAlloc(arena, obj, "_airport_identity");
     var source_scope = try jsonGetStringAlloc(arena, obj, "_source_scope");
@@ -6870,6 +6911,34 @@ test "legacy source meta matches exact group label" {
 
     const suffixed = findSourceMetaForGroup("ssLinks_94cb", &rows) orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.eql(u8, suffixed.profile_id, "prof_a"));
+}
+
+test "legacy migration fills empty enum defaults" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var draft = LegacyNodeDraft{
+        .id = "1",
+        .numeric_id = 1,
+        .fields = std.json.ObjectMap.init(arena),
+        .has_name = true,
+    };
+
+    try jsonPutString(arena, &draft.fields, "type", "0");
+    try jsonPutString(arena, &draft.fields, "name", "legacy ss");
+    try jsonPutString(arena, &draft.fields, "server", "example.com");
+    try jsonPutString(arena, &draft.fields, "port", "8388");
+    try jsonPutString(arena, &draft.fields, "method", "aes-256-gcm");
+    try jsonPutString(arena, &draft.fields, "password", "secret");
+
+    var stats = LegacyMigrationStats{};
+    const json = try buildLegacyNodeJsonAlloc(std.testing.allocator, arena, &draft, &.{}, nowMs(), &stats);
+    defer std.testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expect(std.mem.eql(u8, obj.get("ss_obfs").?.string, "0"));
+    try std.testing.expect(std.mem.eql(u8, obj.get("mode").?.string, "2"));
 }
 
 test "parse skipd list body" {
