@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.6";
+const app_version = "0.1.7";
 const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -593,6 +593,11 @@ const LegacyNodeDraft = struct {
     numeric_id: usize,
     fields: std.json.ObjectMap,
     has_name: bool = false,
+};
+
+const LegacyMigrationStats = struct {
+    subscribe_nodes: usize = 0,
+    legacy_keys_removed: usize = 0,
 };
 
 const SourceMetaRow = struct {
@@ -1806,6 +1811,7 @@ fn runMigrateLegacy(allocator: std.mem.Allocator, query: QueryOptions) !void {
     const source_meta_rows = try loadSourceMetaRows(arena, query.meta_path);
     var drafts = std.ArrayList(LegacyNodeDraft){};
     errdefer drafts.deinit(arena);
+    var stats = LegacyMigrationStats{};
 
     for (pairs) |pair| {
         const parsed = parseLegacyNodeKey(pair.key) orelse continue;
@@ -1829,7 +1835,7 @@ fn runMigrateLegacy(allocator: std.mem.Allocator, query: QueryOptions) !void {
         if (!draft.has_name) continue;
         if (draft.numeric_id > max_id) max_id = draft.numeric_id;
 
-        const raw_node = try buildLegacyNodeJsonAlloc(allocator, arena, draft, source_meta_rows, ts);
+        const raw_node = try buildLegacyNodeJsonAlloc(allocator, arena, draft, source_meta_rows, ts, &stats);
         defer allocator.free(raw_node);
         const normalized = try normalizeNodeJsonForWriteAlloc(allocator, raw_node, draft.id, null, null);
         errdefer allocator.free(normalized);
@@ -1853,6 +1859,7 @@ fn runMigrateLegacy(allocator: std.mem.Allocator, query: QueryOptions) !void {
     if (!query.dry_run) {
         try clearSchema2NodeKeys(allocator, &client);
         try writeSchema2State(allocator, query.socket_path, old_nodes, &state);
+        stats.legacy_keys_removed = try clearLegacyNodeKeys(allocator, &client, pairs);
         const next_id_str = try std.fmt.allocPrint(allocator, "{d}", .{state.next_id});
         defer allocator.free(next_id_str);
         try client.setValue(allocator, "fss_node_next_id", next_id_str);
@@ -1864,6 +1871,8 @@ fn runMigrateLegacy(allocator: std.mem.Allocator, query: QueryOptions) !void {
     try stdout.print("command: migrate-legacy\n", .{});
     try stdout.print("dry_run: {s}\n", .{if (query.dry_run) "1" else "0"});
     try stdout.print("migrated: {d}\n", .{state.nodes.len});
+    try stdout.print("subscribe_nodes: {d}\n", .{stats.subscribe_nodes});
+    try stdout.print("legacy_keys_removed: {d}\n", .{stats.legacy_keys_removed});
     try stdout.print("current: {s}\n", .{state.current_id});
     try stdout.print("failover: {s}\n", .{state.failover_id});
     try stdout.print("next_id: {d}\n", .{state.next_id});
@@ -1885,6 +1894,16 @@ fn clearSchema2NodeKeys(allocator: std.mem.Allocator, client: *SkipdClient) !voi
     try client.removeKey(allocator, "fss_node_failover_identity");
     try client.removeKey(allocator, "fss_current_node_identity");
     try client.removeKey(allocator, "fss_failover_node_identity");
+}
+
+fn clearLegacyNodeKeys(allocator: std.mem.Allocator, client: *SkipdClient, pairs: []const DbPair) !usize {
+    var removed: usize = 0;
+    for (pairs) |pair| {
+        if (parseLegacyNodeKey(pair.key) == null) continue;
+        try client.removeKey(allocator, pair.key);
+        removed += 1;
+    }
+    return removed;
 }
 
 fn parseLegacyNodeKey(key: []const u8) ?struct { id: []const u8, field: []const u8 } {
@@ -1947,7 +1966,7 @@ fn isLegacyJsonB64Field(field: []const u8) bool {
         std.mem.eql(u8, field, "tuic_json");
 }
 
-fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocator, draft: *LegacyNodeDraft, source_meta_rows: []const SourceMetaRow, ts: u64) ![]u8 {
+fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocator, draft: *LegacyNodeDraft, source_meta_rows: []const SourceMetaRow, ts: u64, stats: *LegacyMigrationStats) ![]u8 {
     const node_type = try jsonGetStringAlloc(arena, &draft.fields, "type");
     const group = try jsonGetStringAlloc(arena, &draft.fields, "group");
 
@@ -1987,6 +2006,7 @@ fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocat
         try jsonPutString(arena, &draft.fields, "_airport_identity", row.airport_identity);
         try jsonPutString(arena, &draft.fields, "_source_scope", row.source_scope);
         try jsonPutString(arena, &draft.fields, "_source_url_hash", row.url_hash);
+        stats.subscribe_nodes += 1;
     } else {
         try jsonPutString(arena, &draft.fields, "_source", "migration");
     }
