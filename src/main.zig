@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.5";
+const app_version = "0.1.6";
 const webtest_cache_gen_rev = "20260409_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -656,7 +656,11 @@ fn run() !void {
             try std.fs.File.stdout().writeAll("\n");
         },
         .migrate_legacy => {
-            try runMigrateLegacy(allocator, options.query);
+            runMigrateLegacy(allocator, options.query) catch |err| {
+                const stderr = std.fs.File.stderr().deprecatedWriter();
+                stderr.print("error: migrate-legacy failed: {s}\n", .{@errorName(err)}) catch {};
+                return err;
+            };
         },
         .prune_export_sources => {
             try runPruneExportSources(allocator, options.query);
@@ -2088,6 +2092,15 @@ fn loadSourceMetaRows(allocator: std.mem.Allocator, meta_path: ?[]const u8) ![]S
 
 fn findSourceMetaForGroup(group: []const u8, rows: []const SourceMetaRow) ?SourceMetaRow {
     if (group.len == 0) return null;
+    var exact_group_match: ?SourceMetaRow = null;
+    var exact_group_count: usize = 0;
+    for (rows) |row| {
+        if (row.group_label.len == 0 or !std.mem.eql(u8, row.group_label, group)) continue;
+        exact_group_match = row;
+        exact_group_count += 1;
+    }
+    if (exact_group_count == 1) return exact_group_match;
+
     if (splitGroupSuffix(group)) |parts| {
         for (rows) |row| {
             if (std.mem.eql(u8, row.tag, parts.suffix)) return row;
@@ -2397,6 +2410,11 @@ fn writeSchema2State(allocator: std.mem.Allocator, socket_path: []const u8, old_
             try client.removeKey(allocator, "fss_node_current_identity");
         }
     }
+    if (state.current_id.len > 0) {
+        try client.setValue(allocator, "ssconf_basic_node", state.current_id);
+    } else {
+        try client.removeKey(allocator, "ssconf_basic_node");
+    }
 
     const failover_before_id = try dupOrEmpty(allocator, try client.getAlloc(allocator, "fss_node_failover_backup"));
     defer allocator.free(failover_before_id);
@@ -2410,6 +2428,11 @@ fn writeSchema2State(allocator: std.mem.Allocator, socket_path: []const u8, old_
             try client.removeKey(allocator, "fss_node_failover_backup");
             try client.removeKey(allocator, "fss_node_failover_identity");
         }
+    }
+    if (state.failover_id.len > 0) {
+        try client.setValue(allocator, "ss_failover_s4_3", state.failover_id);
+    } else {
+        try client.removeKey(allocator, "ss_failover_s4_3");
     }
 }
 
@@ -6808,6 +6831,25 @@ test "parse prune export sources args" {
     try std.testing.expect(options.command == .prune_export_sources);
     try std.testing.expect(std.mem.eql(u8, options.query.meta_path.?, "/tmp/fancyss_subs/local_split_meta.tsv"));
     try std.testing.expect(std.mem.eql(u8, options.query.active_source_tags_path.?, "/tmp/fancyss_subs/active_source_tags.txt"));
+}
+
+test "legacy source meta matches exact group label" {
+    const rows = [_]SourceMetaRow{
+        .{
+            .tag = "94cb",
+            .profile_id = "prof_a",
+            .airport_identity = "sslinks",
+            .source_scope = "sslinks_94cb",
+            .url_hash = "94cb",
+            .group_label = "ssLinks",
+        },
+    };
+
+    const exact = findSourceMetaForGroup("ssLinks", &rows) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.eql(u8, exact.profile_id, "prof_a"));
+
+    const suffixed = findSourceMetaForGroup("ssLinks_94cb", &rows) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.eql(u8, suffixed.profile_id, "prof_a"));
 }
 
 test "parse skipd list body" {
