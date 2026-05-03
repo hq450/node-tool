@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.11";
+const app_version = "0.1.12";
 const webtest_cache_gen_rev = "20260503_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -1973,7 +1973,6 @@ fn decodeLegacyB64StringAlloc(allocator: std.mem.Allocator, field: []const u8, r
 fn isLegacyB64Field(field: []const u8) bool {
     return std.mem.eql(u8, field, "password") or
         std.mem.eql(u8, field, "naive_pass") or
-        std.mem.eql(u8, field, "anytls_pass") or
         std.mem.eql(u8, field, "v2ray_json") or
         std.mem.eql(u8, field, "xray_json") or
         std.mem.eql(u8, field, "tuic_json");
@@ -3883,7 +3882,6 @@ fn fancyssResolveStoreField(field: []const u8) []const u8 {
 fn fancyssIsB64Field(field: []const u8) bool {
     return std.mem.eql(u8, field, "password") or
         std.mem.eql(u8, field, "naive_pass") or
-        std.mem.eql(u8, field, "anytls_pass") or
         std.mem.eql(u8, field, "v2ray_json") or
         std.mem.eql(u8, field, "xray_json") or
         std.mem.eql(u8, field, "tuic_json");
@@ -5971,7 +5969,6 @@ fn normalizeLegacyB64Fields(arena: std.mem.Allocator, obj: *std.json.ObjectMap, 
 
     try maybeDecodeLegacyB64Field(arena, obj, "password", false);
     try maybeDecodeLegacyB64Field(arena, obj, "naive_pass", false);
-    try maybeDecodeLegacyB64Field(arena, obj, "anytls_pass", false);
     try maybeDecodeLegacyB64Field(arena, obj, "v2ray_json", true);
     try maybeDecodeLegacyB64Field(arena, obj, "xray_json", true);
     try maybeDecodeLegacyB64Field(arena, obj, "tuic_json", true);
