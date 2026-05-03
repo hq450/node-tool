@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const app_version = "0.1.8";
-const webtest_cache_gen_rev = "20260409_1";
+const app_version = "0.1.11";
+const webtest_cache_gen_rev = "20260503_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
@@ -39,6 +39,7 @@ const OutputFormat = enum {
     json,
     jsonl,
     text,
+    summary,
     shell,
 };
 
@@ -272,6 +273,8 @@ const NodeJson = struct {
     naive_port: ?[]const u8 = null,
     hy2_server: ?[]const u8 = null,
     hy2_port: ?[]const u8 = null,
+    anytls_server: ?[]const u8 = null,
+    anytls_port: ?[]const u8 = null,
     server_ip: ?[]const u8 = null,
     latency: ?[]const u8 = null,
     ping: ?[]const u8 = null,
@@ -457,6 +460,9 @@ const tracked_plan_fields = [_][]const u8{
     "hy2_obfs",
     "hy2_up",
     "hy2_dl",
+    "anytls_server",
+    "anytls_port",
+    "anytls_sni",
 };
 
 const PlanFieldChange = struct {
@@ -1144,6 +1150,17 @@ fn runStat(allocator: std.mem.Allocator, nodes: []NodeRecord, query: QueryOption
             try writeStatArray(stdout, sources.items);
             try stdout.writeAll("]}\n");
         },
+        .summary => {
+            const stdout = std.fs.File.stdout().deprecatedWriter();
+            for (protocols.items, 0..) |item, idx| {
+                if (idx > 0) try stdout.writeAll("；");
+                try stdout.print("{s}：{d}个", .{ item.key, item.count });
+            }
+            if (protocols.items.len == 0) {
+                try stdout.writeAll("无");
+            }
+            try stdout.writeAll("\n");
+        },
         else => unreachable,
     }
 }
@@ -1768,6 +1785,7 @@ fn resolveStatFormat(raw: ?[]const u8) !OutputFormat {
     const format = raw orelse "text";
     if (std.ascii.eqlIgnoreCase(format, "text")) return .text;
     if (std.ascii.eqlIgnoreCase(format, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(format, "summary")) return .summary;
     return error.InvalidArguments;
 }
 
@@ -1955,6 +1973,7 @@ fn decodeLegacyB64StringAlloc(allocator: std.mem.Allocator, field: []const u8, r
 fn isLegacyB64Field(field: []const u8) bool {
     return std.mem.eql(u8, field, "password") or
         std.mem.eql(u8, field, "naive_pass") or
+        std.mem.eql(u8, field, "anytls_pass") or
         std.mem.eql(u8, field, "v2ray_json") or
         std.mem.eql(u8, field, "xray_json") or
         std.mem.eql(u8, field, "tuic_json");
@@ -1984,6 +2003,7 @@ fn buildLegacyNodeJsonAlloc(allocator: std.mem.Allocator, arena: std.mem.Allocat
     try normalizeLegacyBoolField(arena, &draft.fields, "trojan_tfo");
     try normalizeLegacyBoolField(arena, &draft.fields, "hy2_ai");
     try normalizeLegacyBoolField(arena, &draft.fields, "hy2_tfo");
+    try normalizeLegacyBoolField(arena, &draft.fields, "anytls_ai");
     try normalizeNodeDefaultFields(arena, &draft.fields);
 
     _ = draft.fields.orderedRemove("server_ip");
@@ -2059,6 +2079,8 @@ fn normalizeNodeDefaultFields(allocator: std.mem.Allocator, obj: *std.json.Objec
         try normalizeLegacyDefaultField(allocator, obj, "naive_prot", "https");
     } else if (std.mem.eql(u8, node_type, "8")) {
         try normalizeLegacyDefaultField(allocator, obj, "hy2_obfs", "0");
+    } else if (std.mem.eql(u8, node_type, "9")) {
+        try normalizeLegacyDefaultField(allocator, obj, "anytls_ai", "0");
     }
 }
 
@@ -2108,6 +2130,9 @@ fn keepLegacyTypeField(node_type: []const u8, key: []const u8) bool {
     }
     if (std.mem.eql(u8, node_type, "8")) {
         return stringIn(key, &.{ "hy2_server", "hy2_port", "hy2_pass", "hy2_up", "hy2_dl", "hy2_obfs", "hy2_obfs_pass", "hy2_sni", "hy2_pcs", "hy2_vcn", "hy2_ai", "hy2_tfo", "hy2_cg" });
+    }
+    if (std.mem.eql(u8, node_type, "9")) {
+        return stringIn(key, &.{ "anytls_server", "anytls_port", "anytls_pass", "anytls_sni", "anytls_ai" });
     }
     return false;
 }
@@ -2813,7 +2838,7 @@ fn importNodeDocument(allocator: std.mem.Allocator, state: *SchemaState, raw_doc
     } else if (query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0 and findNodeIndexById(match_nodes, hints.preferred_id.?) == null) {
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else if (!query.reuse_ids and hints.preferred_id != null and hints.preferred_id.?.len > 0) {
-        if (findNodeIndexById(state.nodes, hints.preferred_id.? ) != null) return error.NodeIdConflict;
+        if (findNodeIndexById(state.nodes, hints.preferred_id.?) != null) return error.NodeIdConflict;
         assigned_id = try allocator.dupe(u8, hints.preferred_id.?);
     } else {
         assigned_id = try std.fmt.allocPrint(allocator, "{d}", .{state.next_id});
@@ -3858,6 +3883,7 @@ fn fancyssResolveStoreField(field: []const u8) []const u8 {
 fn fancyssIsB64Field(field: []const u8) bool {
     return std.mem.eql(u8, field, "password") or
         std.mem.eql(u8, field, "naive_pass") or
+        std.mem.eql(u8, field, "anytls_pass") or
         std.mem.eql(u8, field, "v2ray_json") or
         std.mem.eql(u8, field, "xray_json") or
         std.mem.eql(u8, field, "tuic_json");
@@ -4018,8 +4044,11 @@ fn buildWebtestObfsStartPortMap(allocator: std.mem.Allocator, ids_file: []const 
         if (node_id.len == 0) continue;
         const idx = findNodeIndexById(nodes, node_id) orelse continue;
         const node = nodes[idx];
-        if (!std.mem.eql(u8, node.type_id, "0")) continue;
-        if (!containsSsObfs(node.raw_json)) continue;
+        if (std.mem.eql(u8, node.type_id, "0")) {
+            if (!containsSsObfs(node.raw_json)) continue;
+        } else if (!std.mem.eql(u8, node.type_id, "9")) {
+            continue;
+        }
         try obfs_ids.append(allocator, node.id);
     }
 
@@ -4557,6 +4586,9 @@ fn buildWebtestNodeArtifactNative(allocator: std.mem.Allocator, node: NodeRecord
     if (std.mem.eql(u8, node.type_id, "8")) {
         return try buildWebtestHy2Native(allocator, node, node_dir, meta_dir, runtime_cfg);
     }
+    if (std.mem.eql(u8, node.type_id, "9")) {
+        return try buildWebtestAnyTlsNative(allocator, node, node_dir, meta_dir, runtime_cfg, obfs_start_ports.get(node.id));
+    }
     return false;
 }
 
@@ -4649,6 +4681,13 @@ fn webtestNativeFallbackReason(allocator: std.mem.Allocator, node: NodeRecord, o
         if (pass == null or pass.?.len == 0) return "hy2_password_missing";
         return "native_supported";
     }
+    if (std.mem.eql(u8, node.type_id, "9")) {
+        const pass = try extractStringFieldAlloc(allocator, node.raw_json, "anytls_pass");
+        defer if (pass) |value| allocator.free(value);
+        if (pass == null or pass.?.len == 0) return "anytls_password_missing";
+        if (obfs_start_port == null) return "anytls_port_unavailable";
+        return "native_supported";
+    }
     return "protocol_not_supported";
 }
 
@@ -4689,37 +4728,35 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         try allocator.dupe(u8, node.port);
     defer allocator.free(target_port);
 
-    const out_json = try std.fmt.allocPrint(allocator,
-        "{{\n" ++
-            "  \"tag\": \"proxy{s}\",\n" ++
-            "  \"protocol\": \"shadowsocks\",\n" ++
-            "  \"settings\": {{\n" ++
-            "    \"servers\": [{{\n" ++
-            "      \"address\": \"{s}\",\n" ++
-            "      \"port\": {s},\n" ++
-            "      \"password\": \"{s}\",\n" ++
-            "      \"method\": \"{s}\",\n" ++
-            "      \"uot\": {s}\n" ++
-            "    }}]\n" ++
-            "  }},\n" ++
-            "  \"streamSettings\": {{\n" ++
-            "    \"network\": \"raw\"\n" ++
-            "  }},\n" ++
-            "  \"sockopt\": {{\n" ++
-            "    \"tcpFastOpen\": {s},\n" ++
-            "    \"tcpMptcp\": false,\n" ++
-            "    \"tcpcongestion\": \"bbr\"\n" ++
-            "  }}\n" ++
-            "}}\n",
-        .{
-            node.id,
-            target_addr,
-            target_port,
-            password.?,
-            method.?,
-            if (obfs_mode != null) "true" else "false",
-            if (tcp_fast_open) "true" else "false",
-        });
+    const out_json = try std.fmt.allocPrint(allocator, "{{\n" ++
+        "  \"tag\": \"proxy{s}\",\n" ++
+        "  \"protocol\": \"shadowsocks\",\n" ++
+        "  \"settings\": {{\n" ++
+        "    \"servers\": [{{\n" ++
+        "      \"address\": \"{s}\",\n" ++
+        "      \"port\": {s},\n" ++
+        "      \"password\": \"{s}\",\n" ++
+        "      \"method\": \"{s}\",\n" ++
+        "      \"uot\": {s}\n" ++
+        "    }}]\n" ++
+        "  }},\n" ++
+        "  \"streamSettings\": {{\n" ++
+        "    \"network\": \"raw\"\n" ++
+        "  }},\n" ++
+        "  \"sockopt\": {{\n" ++
+        "    \"tcpFastOpen\": {s},\n" ++
+        "    \"tcpMptcp\": false,\n" ++
+        "    \"tcpcongestion\": \"bbr\"\n" ++
+        "  }}\n" ++
+        "}}\n", .{
+        node.id,
+        target_addr,
+        target_port,
+        password.?,
+        method.?,
+        if (obfs_mode != null) "true" else "false",
+        if (tcp_fast_open) "true" else "false",
+    });
     defer allocator.free(out_json);
     try writeFileAtomic(out_path, out_json);
 
@@ -4744,39 +4781,35 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
             try allocator.dupe(u8, "");
         defer allocator.free(obfs_host_segment);
 
-        const start_script = try std.fmt.allocPrint(allocator,
-            "#!/bin/sh\n" ++
-                "_wt_root=${{WT_RUNTIME_ROOT:-$(cd \"$(dirname \"$0\")/..\" && pwd)}}\n" ++
-                "\"${{_wt_root}}/wt-obfs\" -s {s} -p {s} -l {d} --obfs {s}{s}{s} >/dev/null 2>&1 &\n" ++
-                "_i=20\n" ++
-                "while [ ${{_i}} -gt 0 ]; do\n" ++
-                "    netstat -nl 2>/dev/null | awk '{{print $4}}' | grep -E \"[:\\\\.]{d}$\" >/dev/null 2>&1 && break\n" ++
-                "    usleep 100000\n" ++
-                "    _i=$((_i - 1))\n" ++
-                "done\n",
-            .{
-                server_quoted,
-                remote_port_quoted,
-                obfs_start_port.?,
-                obfs_quoted,
-                obfs_host_segment,
-                if (tcp_fast_open) " --fast-open" else "",
-                obfs_start_port.?,
-            });
+        const start_script = try std.fmt.allocPrint(allocator, "#!/bin/sh\n" ++
+            "_wt_root=${{WT_RUNTIME_ROOT:-$(cd \"$(dirname \"$0\")/..\" && pwd)}}\n" ++
+            "\"${{_wt_root}}/wt-obfs\" -s {s} -p {s} -l {d} --obfs {s}{s}{s} >/dev/null 2>&1 &\n" ++
+            "_i=20\n" ++
+            "while [ ${{_i}} -gt 0 ]; do\n" ++
+            "    netstat -nl 2>/dev/null | awk '{{print $4}}' | grep -E \"[:\\\\.]{d}$\" >/dev/null 2>&1 && break\n" ++
+            "    usleep 100000\n" ++
+            "    _i=$((_i - 1))\n" ++
+            "done\n", .{
+            server_quoted,
+            remote_port_quoted,
+            obfs_start_port.?,
+            obfs_quoted,
+            obfs_host_segment,
+            if (tcp_fast_open) " --fast-open" else "",
+            obfs_start_port.?,
+        });
         defer allocator.free(start_script);
         try writeExecutableFileAtomic(start_path, start_script);
 
-        const stop_script = try std.fmt.allocPrint(allocator,
-            "#!/bin/sh\n" ++
-                "_pid=$(ps -w | grep \"wt-obfs\" | grep -w {s} | grep -w {s} | grep -w {d} | awk '{{print $1}}' | sed -n '1p')\n" ++
-                "if [ -n \"${{_pid}}\" ]; then\n" ++
-                "    kill -9 ${{_pid}}\n" ++
-                "fi\n",
-            .{
-                server_quoted,
-                remote_port_quoted,
-                obfs_start_port.?,
-            });
+        const stop_script = try std.fmt.allocPrint(allocator, "#!/bin/sh\n" ++
+            "_pid=$(ps -w | grep \"wt-obfs\" | grep -w {s} | grep -w {s} | grep -w {d} | awk '{{print $1}}' | sed -n '1p')\n" ++
+            "if [ -n \"${{_pid}}\" ]; then\n" ++
+            "    kill -9 ${{_pid}}\n" ++
+            "fi\n", .{
+            server_quoted,
+            remote_port_quoted,
+            obfs_start_port.?,
+        });
         defer allocator.free(stop_script);
         try writeExecutableFileAtomic(stop_path, stop_script);
     } else {
@@ -4784,30 +4817,28 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         std.fs.cwd().deleteFile(stop_path) catch {};
     }
 
-    const meta = try std.fmt.allocPrint(allocator,
-        "node_type=0\n" ++
-            "node_rev={d}\n" ++
-            "linux_ver={s}\n" ++
-            "ss_basic_tfo={s}\n" ++
-            "server_resolv_mode={s}\n" ++
-            "server_resolver={s}\n" ++
-            "builder=native\n" ++
-            "builder_reason=native\n" ++
-            "has_start={s}\n" ++
-            "has_stop={s}\n" ++
-            "start_port={s}\n" ++
-            "built_at={d}\n",
-        .{
-            node.rev,
-            runtime_cfg.linux_ver,
-            runtime_cfg.tfo,
-            runtime_cfg.resolv_mode,
-            runtime_cfg.resolver,
-            if (obfs_mode != null) "1" else "0",
-            if (obfs_mode != null) "1" else "0",
-            if (obfs_mode != null) target_port else "",
-            std.time.timestamp(),
-        });
+    const meta = try std.fmt.allocPrint(allocator, "node_type=0\n" ++
+        "node_rev={d}\n" ++
+        "linux_ver={s}\n" ++
+        "ss_basic_tfo={s}\n" ++
+        "server_resolv_mode={s}\n" ++
+        "server_resolver={s}\n" ++
+        "builder=native\n" ++
+        "builder_reason=native\n" ++
+        "has_start={s}\n" ++
+        "has_stop={s}\n" ++
+        "start_port={s}\n" ++
+        "built_at={d}\n", .{
+        node.rev,
+        runtime_cfg.linux_ver,
+        runtime_cfg.tfo,
+        runtime_cfg.resolv_mode,
+        runtime_cfg.resolver,
+        if (obfs_mode != null) "1" else "0",
+        if (obfs_mode != null) "1" else "0",
+        if (obfs_mode != null) target_port else "",
+        std.time.timestamp(),
+    });
     defer allocator.free(meta);
     try writeFileAtomic(meta_path, meta);
     return true;
@@ -4833,7 +4864,8 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
         defer allocator.free(wrapped.?);
         try writeFileAtomic(out_path, wrapped.?);
 
-        const meta = try std.fmt.allocPrint(allocator,
+        const meta = try std.fmt.allocPrint(
+            allocator,
             "node_type=3\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
             .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
         );
@@ -4918,7 +4950,8 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     defer allocator.free(alpn_json);
 
     const tls_json = if (std.mem.eql(u8, sec, "tls"))
-        try std.fmt.allocPrint(allocator,
+        try std.fmt.allocPrint(
+            allocator,
             "{{\"allowInsecure\":{s},\"alpn\":{s},\"serverName\":{s}}}",
             .{
                 if (ai != null and std.mem.eql(u8, ai.?, "1")) "true" else "false",
@@ -4930,96 +4963,82 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
         try allocator.dupe(u8, "null");
     defer allocator.free(tls_json);
 
-    const ws_json = if (std.mem.eql(u8, net, "ws"))
-        ws: {
-            const path_json = try allocJsonStringOrNull(allocator, path);
-            defer allocator.free(path_json);
-            const headers_json = if (host != null and host.?.len > 0)
-                try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
-            else
-                try allocator.dupe(u8, "null");
-            defer allocator.free(headers_json);
-            break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const ws_json = if (std.mem.eql(u8, net, "ws")) ws: {
+        const path_json = try allocJsonStringOrNull(allocator, path);
+        defer allocator.free(path_json);
+        const headers_json = if (host != null and host.?.len > 0)
+            try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
+        else
+            try allocator.dupe(u8, "null");
+        defer allocator.free(headers_json);
+        break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
 
-    const grpc_json = if (std.mem.eql(u8, net, "grpc"))
-        grpc: {
-            const service_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(service_json);
-            const authority_json = try allocJsonStringOrEmpty(allocator, grpc_authority);
-            defer allocator.free(authority_json);
-            break :grpc try std.fmt.allocPrint(allocator, "{{\"serviceName\":{s},\"authority\":{s},\"multiMode\":{s}}}", .{
-                service_json,
-                authority_json,
-                if (grpc_mode != null and std.mem.eql(u8, grpc_mode.?, "multi")) "true" else "false",
-            });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const grpc_json = if (std.mem.eql(u8, net, "grpc")) grpc: {
+        const service_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(service_json);
+        const authority_json = try allocJsonStringOrEmpty(allocator, grpc_authority);
+        defer allocator.free(authority_json);
+        break :grpc try std.fmt.allocPrint(allocator, "{{\"serviceName\":{s},\"authority\":{s},\"multiMode\":{s}}}", .{
+            service_json,
+            authority_json,
+            if (grpc_mode != null and std.mem.eql(u8, grpc_mode.?, "multi")) "true" else "false",
+        });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(grpc_json);
 
-    const http_json = if (std.mem.eql(u8, net, "h2"))
-        h2: {
-            var host_json = std.ArrayList(u8){};
-            defer host_json.deinit(allocator);
-            const writer = host_json.writer(allocator);
-            if (host != null and host.?.len > 0) {
-                try writer.writeByte('[');
-                var parts = std.mem.splitScalar(u8, host.?, ',');
-                var idx: usize = 0;
-                while (parts.next()) |part_raw| {
-                    const part = std.mem.trim(u8, part_raw, " \t\r\n");
-                    if (part.len == 0) continue;
-                    if (idx > 0) try writer.writeByte(',');
-                    try writeJsonString(writer, part);
-                    idx += 1;
-                }
-                try writer.writeByte(']');
-            } else {
-                try writer.writeAll("null");
+    const http_json = if (std.mem.eql(u8, net, "h2")) h2: {
+        var host_json = std.ArrayList(u8){};
+        defer host_json.deinit(allocator);
+        const writer = host_json.writer(allocator);
+        if (host != null and host.?.len > 0) {
+            try writer.writeByte('[');
+            var parts = std.mem.splitScalar(u8, host.?, ',');
+            var idx: usize = 0;
+            while (parts.next()) |part_raw| {
+                const part = std.mem.trim(u8, part_raw, " \t\r\n");
+                if (part.len == 0) continue;
+                if (idx > 0) try writer.writeByte(',');
+                try writeJsonString(writer, part);
+                idx += 1;
             }
-            const path_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(path_json);
-            break :h2 try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json.items });
+            try writer.writeByte(']');
+        } else {
+            try writer.writeAll("null");
         }
-    else
-        try allocator.dupe(u8, "null");
+        const path_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(path_json);
+        break :h2 try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json.items });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(http_json);
 
-    const quic_json = if (std.mem.eql(u8, net, "quic"))
-        quic: {
-            const security_json = try allocJsonStringOrEmpty(allocator, host);
-            defer allocator.free(security_json);
-            const key_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(key_json);
-            const header_type_json = try allocJsonStringOrEmpty(allocator, headtype_quic);
-            defer allocator.free(header_type_json);
-            break :quic try std.fmt.allocPrint(allocator, "{{\"security\":{s},\"key\":{s},\"header\":{{\"type\":{s}}}}}", .{
-                security_json,
-                key_json,
-                header_type_json,
-            });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const quic_json = if (std.mem.eql(u8, net, "quic")) quic: {
+        const security_json = try allocJsonStringOrEmpty(allocator, host);
+        defer allocator.free(security_json);
+        const key_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(key_json);
+        const header_type_json = try allocJsonStringOrEmpty(allocator, headtype_quic);
+        defer allocator.free(header_type_json);
+        break :quic try std.fmt.allocPrint(allocator, "{{\"security\":{s},\"key\":{s},\"header\":{{\"type\":{s}}}}}", .{
+            security_json,
+            key_json,
+            header_type_json,
+        });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(quic_json);
 
-    const kcp_json = if (std.mem.eql(u8, net, "kcp"))
-        kcp: {
-            const header_type_json = try allocJsonStringOrEmpty(allocator, headtype_kcp);
-            defer allocator.free(header_type_json);
-            const seed_json = try allocJsonStringOrNull(allocator, kcp_seed);
-            defer allocator.free(seed_json);
-            break :kcp try std.fmt.allocPrint(allocator,
-                "{{\"mtu\":1350,\"tti\":50,\"uplinkCapacity\":12,\"downlinkCapacity\":100,\"congestion\":false,\"readBufferSize\":2,\"writeBufferSize\":2,\"header\":{{\"type\":{s}}},\"seed\":{s}}}",
-                .{ header_type_json, seed_json },
-            );
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const kcp_json = if (std.mem.eql(u8, net, "kcp")) kcp: {
+        const header_type_json = try allocJsonStringOrEmpty(allocator, headtype_kcp);
+        defer allocator.free(header_type_json);
+        const seed_json = try allocJsonStringOrNull(allocator, kcp_seed);
+        defer allocator.free(seed_json);
+        break :kcp try std.fmt.allocPrint(
+            allocator,
+            "{{\"mtu\":1350,\"tti\":50,\"uplinkCapacity\":12,\"downlinkCapacity\":100,\"congestion\":false,\"readBufferSize\":2,\"writeBufferSize\":2,\"header\":{{\"type\":{s}}},\"seed\":{s}}}",
+            .{ header_type_json, seed_json },
+        );
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(kcp_json);
 
     const tcp_json = try allocator.dupe(u8, "null");
@@ -5030,7 +5049,8 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     const mux_enabled = mux_enable != null and std.mem.eql(u8, mux_enable.?, "1");
     const mux_value = if (mux_enabled and mux_concurrency != null and mux_concurrency.?.len > 0) mux_concurrency.? else if (mux_enabled) "8" else "-1";
 
-    const out_json = try std.fmt.allocPrint(allocator,
+    const out_json = try std.fmt.allocPrint(
+        allocator,
         "{{\n" ++
             "  \"tag\": \"proxy{s}\",\n" ++
             "  \"protocol\": \"vmess\",\n" ++
@@ -5062,7 +5082,8 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     defer allocator.free(out_json);
     try writePrettyJsonStripNullsFile(allocator, out_path, out_json);
 
-    const meta = try std.fmt.allocPrint(allocator,
+    const meta = try std.fmt.allocPrint(
+        allocator,
         "node_type=3\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
         .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
     );
@@ -5091,7 +5112,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
         defer allocator.free(wrapped.?);
         try writeFileAtomic(out_path, wrapped.?);
 
-        const meta = try std.fmt.allocPrint(allocator,
+        const meta = try std.fmt.allocPrint(
+            allocator,
             "node_type=4\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
             .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
         );
@@ -5195,7 +5217,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
         try allocator.dupe(u8, "null");
     defer allocator.free(flow_json);
     const user_json = if (std.mem.eql(u8, prot, "vless"))
-        try std.fmt.allocPrint(allocator,
+        try std.fmt.allocPrint(
+            allocator,
             "{{\"id\":\"{s}\",\"encryption\":\"{s}\",\"flow\":{s}}}",
             .{
                 uuid.?,
@@ -5204,7 +5227,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
             },
         )
     else
-        try std.fmt.allocPrint(allocator,
+        try std.fmt.allocPrint(
+            allocator,
             "{{\"id\":\"{s}\",\"security\":\"{s}\"}}",
             .{
                 uuid.?,
@@ -5224,7 +5248,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     defer allocator.free(alpn_json);
 
     const tls_json = if (std.mem.eql(u8, sec, "tls"))
-        try std.fmt.allocPrint(allocator,
+        try std.fmt.allocPrint(
+            allocator,
             "{{\"allowInsecure\":{s},\"alpn\":{s},\"serverName\":{s},\"fingerprint\":{s},\"pinnedPeerCertSha256\":{s},\"verifyPeerCertByName\":{s}}}",
             .{
                 if (ai != null and std.mem.eql(u8, ai.?, "1")) "true" else "null",
@@ -5240,7 +5265,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     defer allocator.free(tls_json);
 
     const reality_json = if (std.mem.eql(u8, sec, "reality"))
-        try std.fmt.allocPrint(allocator,
+        try std.fmt.allocPrint(
+            allocator,
             "{{\"show\":{s},\"fingerprint\":{s},\"serverName\":{s},\"publicKey\":{s},\"shortId\":{s},\"spiderX\":{s}}}",
             .{
                 if (show != null and std.mem.eql(u8, show.?, "1")) "true" else "false",
@@ -5255,65 +5281,54 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
         try allocator.dupe(u8, "null");
     defer allocator.free(reality_json);
 
-    const ws_json = if (std.mem.eql(u8, net, "ws"))
-        ws: {
-            const path_json = try allocJsonStringOrNull(allocator, path);
-            defer allocator.free(path_json);
-            const headers_json = if (host != null and host.?.len > 0)
-                try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
-            else
-                try allocator.dupe(u8, "null");
-            defer allocator.free(headers_json);
-            break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const ws_json = if (std.mem.eql(u8, net, "ws")) ws: {
+        const path_json = try allocJsonStringOrNull(allocator, path);
+        defer allocator.free(path_json);
+        const headers_json = if (host != null and host.?.len > 0)
+            try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
+        else
+            try allocator.dupe(u8, "null");
+        defer allocator.free(headers_json);
+        break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
-    const grpc_json = if (std.mem.eql(u8, net, "grpc"))
-        grpc: {
-            const service_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(service_json);
-            const authority_json = try allocJsonStringOrEmpty(allocator, grpc_authority);
-            defer allocator.free(authority_json);
-            break :grpc try std.fmt.allocPrint(allocator, "{{\"serviceName\":{s},\"authority\":{s},\"multiMode\":{s}}}", .{
-                service_json,
-                authority_json,
-                if (grpc_mode != null and std.mem.eql(u8, grpc_mode.?, "multi")) "true" else "false",
-            });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const grpc_json = if (std.mem.eql(u8, net, "grpc")) grpc: {
+        const service_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(service_json);
+        const authority_json = try allocJsonStringOrEmpty(allocator, grpc_authority);
+        defer allocator.free(authority_json);
+        break :grpc try std.fmt.allocPrint(allocator, "{{\"serviceName\":{s},\"authority\":{s},\"multiMode\":{s}}}", .{
+            service_json,
+            authority_json,
+            if (grpc_mode != null and std.mem.eql(u8, grpc_mode.?, "multi")) "true" else "false",
+        });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(grpc_json);
-    const xhttp_json = if (std.mem.eql(u8, net, "xhttp"))
-        xhttp: {
-            const path_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(path_json);
-            const host_json = try allocJsonStringOrEmpty(allocator, host);
-            defer allocator.free(host_json);
-            break :xhttp try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s},\"mode\":\"{s}\"}}", .{
-                path_json,
-                host_json,
-                if (xhttp_mode) |value| value else "auto",
-            });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const xhttp_json = if (std.mem.eql(u8, net, "xhttp")) xhttp: {
+        const path_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(path_json);
+        const host_json = try allocJsonStringOrEmpty(allocator, host);
+        defer allocator.free(host_json);
+        break :xhttp try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s},\"mode\":\"{s}\"}}", .{
+            path_json,
+            host_json,
+            if (xhttp_mode) |value| value else "auto",
+        });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(xhttp_json);
-    const httpupgrade_json = if (std.mem.eql(u8, net, "httpupgrade"))
-        httpupgrade: {
-            const path_json = try allocJsonStringOrEmpty(allocator, path);
-            defer allocator.free(path_json);
-            const host_json = try allocJsonStringOrEmpty(allocator, host);
-            defer allocator.free(host_json);
-            break :httpupgrade try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json });
-        }
-    else
-        try allocator.dupe(u8, "null");
+    const httpupgrade_json = if (std.mem.eql(u8, net, "httpupgrade")) httpupgrade: {
+        const path_json = try allocJsonStringOrEmpty(allocator, path);
+        defer allocator.free(path_json);
+        const host_json = try allocJsonStringOrEmpty(allocator, host);
+        defer allocator.free(host_json);
+        break :httpupgrade try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json });
+    } else try allocator.dupe(u8, "null");
     defer allocator.free(httpupgrade_json);
     const tcp_json = try allocator.dupe(u8, "null");
     defer allocator.free(tcp_json);
 
-    const out_json = try std.fmt.allocPrint(allocator,
+    const out_json = try std.fmt.allocPrint(
+        allocator,
         "{{\n" ++
             "  \"tag\": \"proxy{s}\",\n" ++
             "  \"protocol\": \"{s}\",\n" ++
@@ -5342,7 +5357,8 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     defer allocator.free(out_json);
     try writePrettyJsonStripNullsFile(allocator, out_path, out_json);
 
-    const meta = try std.fmt.allocPrint(allocator,
+    const meta = try std.fmt.allocPrint(
+        allocator,
         "node_type=4\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
         .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
     );
@@ -5386,7 +5402,8 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
-    const out_json = try std.fmt.allocPrint(allocator,
+    const out_json = try std.fmt.allocPrint(
+        allocator,
         "{{\n" ++
             "  \"tag\": \"proxy{s}\",\n" ++
             "  \"protocol\": \"trojan\",\n" ++
@@ -5423,7 +5440,8 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
     defer allocator.free(out_json);
     try writeFileAtomic(out_path, out_json);
 
-    const meta = try std.fmt.allocPrint(allocator,
+    const meta = try std.fmt.allocPrint(
+        allocator,
         "node_type=5\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
         .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
     );
@@ -5485,7 +5503,8 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     else
         try allocator.dupe(u8, "");
     defer allocator.free(finalmask_value);
-    const out_json = try std.fmt.allocPrint(allocator,
+    const out_json = try std.fmt.allocPrint(
+        allocator,
         "{{\n" ++
             "  \"tag\": \"proxy{s}\",\n" ++
             "  \"protocol\": \"hysteria\",\n" ++
@@ -5518,9 +5537,112 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     defer allocator.free(out_json);
     try writeFileAtomic(out_path, out_json);
 
-    const meta = try std.fmt.allocPrint(allocator,
+    const meta = try std.fmt.allocPrint(
+        allocator,
         "node_type=8\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=0\nhas_stop=0\nstart_port=\nbuilt_at={d}\n",
         .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, std.time.timestamp() },
+    );
+    defer allocator.free(meta);
+    try writeFileAtomic(meta_path, meta);
+    return true;
+}
+
+fn anytlsServerAddrAlloc(allocator: std.mem.Allocator, server: []const u8, port: []const u8) ![]u8 {
+    if (std.mem.indexOfScalar(u8, server, ':') != null and !(std.mem.startsWith(u8, server, "[") and std.mem.endsWith(u8, server, "]"))) {
+        return try std.fmt.allocPrint(allocator, "[{s}]:{s}", .{ server, port });
+    }
+    return try std.fmt.allocPrint(allocator, "{s}:{s}", .{ server, port });
+}
+
+fn buildWebtestAnyTlsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir: []const u8, meta_dir: []const u8, runtime_cfg: WebtestRuntimeConfig, start_port_opt: ?u16) !bool {
+    const start_port = start_port_opt orelse return false;
+    const anytls_pass = try extractStringFieldAlloc(allocator, node.raw_json, "anytls_pass");
+    defer if (anytls_pass) |value| allocator.free(value);
+    if (anytls_pass == null or anytls_pass.?.len == 0) return false;
+    const anytls_sni = try extractStringFieldAlloc(allocator, node.raw_json, "anytls_sni");
+    defer if (anytls_sni) |value| allocator.free(value);
+    const anytls_ai = try extractStringFieldAlloc(allocator, node.raw_json, "anytls_ai");
+    defer if (anytls_ai) |value| allocator.free(value);
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
+    defer allocator.free(out_path);
+    const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
+    defer allocator.free(meta_path);
+    const start_path = try std.fmt.allocPrint(allocator, "{s}/{s}_start.sh", .{ node_dir, node.id });
+    defer allocator.free(start_path);
+    const stop_path = try std.fmt.allocPrint(allocator, "{s}/{s}_stop.sh", .{ node_dir, node.id });
+    defer allocator.free(stop_path);
+    const pass_path = try std.fmt.allocPrint(allocator, "{s}/{s}_anytls.pass", .{ node_dir, node.id });
+    defer allocator.free(pass_path);
+    const pid_path = try std.fmt.allocPrint(allocator, "{s}/{s}_anytls.pid", .{ node_dir, node.id });
+    defer allocator.free(pid_path);
+    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{start_port});
+    defer allocator.free(port_text);
+    const server_addr = try anytlsServerAddrAlloc(allocator, node.server, node.port);
+    defer allocator.free(server_addr);
+    const server_addr_q = try shellQuoteAlloc(allocator, server_addr);
+    defer allocator.free(server_addr_q);
+    const pass_path_q = try shellQuoteAlloc(allocator, pass_path);
+    defer allocator.free(pass_path_q);
+    const pid_path_q = try shellQuoteAlloc(allocator, pid_path);
+    defer allocator.free(pid_path_q);
+    const listen_addr = try std.fmt.allocPrint(allocator, "127.0.0.1:{s}", .{port_text});
+    defer allocator.free(listen_addr);
+    const listen_q = try shellQuoteAlloc(allocator, listen_addr);
+    defer allocator.free(listen_q);
+    const sni_arg = blk: {
+        const sni_value = if (anytls_sni) |value| value else "";
+        if (sni_value.len == 0) break :blk try allocator.dupe(u8, "");
+        const sni_q = try shellQuoteAlloc(allocator, sni_value);
+        defer allocator.free(sni_q);
+        break :blk try std.fmt.allocPrint(allocator, " -sni {s}", .{sni_q});
+    };
+    defer allocator.free(sni_arg);
+    const verify_arg = if (anytls_ai != null and std.mem.eql(u8, anytls_ai.?, "1"))
+        try allocator.dupe(u8, " --insecure")
+    else
+        try allocator.dupe(u8, " --verify");
+    defer allocator.free(verify_arg);
+
+    const out_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\n" ++
+            "  \"tag\": \"proxy{s}\",\n" ++
+            "  \"protocol\": \"socks\",\n" ++
+            "  \"settings\": {{\"servers\": [{{\"address\": \"127.0.0.1\", \"port\": {s}}}]}},\n" ++
+            "  \"streamSettings\": {{\"network\": \"tcp\"}}\n" ++
+            "}}\n",
+        .{ node.id, port_text },
+    );
+    defer allocator.free(out_json);
+    try writeFileAtomic(out_path, out_json);
+    try writeFileAtomic(pass_path, anytls_pass.?);
+
+    const start_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n" ++
+            "pid_file={s}\n" ++
+            "if [ -s \"$pid_file\" ]; then kill \"$(cat \"$pid_file\")\" >/dev/null 2>&1 || true; rm -f \"$pid_file\"; fi\n" ++
+            "\"/koolshare/bin/anytls-zig\" -server {s} --password-file {s} -l {s}{s}{s} >/dev/null 2>&1 &\n" ++
+            "echo $! > \"$pid_file\"\n",
+        .{ pid_path_q, server_addr_q, pass_path_q, listen_q, sni_arg, verify_arg },
+    );
+    defer allocator.free(start_script);
+    try writeExecutableFileAtomic(start_path, start_script);
+
+    const stop_script = try std.fmt.allocPrint(
+        allocator,
+        "#!/bin/sh\n" ++
+            "pid_file={s}\n" ++
+            "if [ -s \"$pid_file\" ]; then kill \"$(cat \"$pid_file\")\" >/dev/null 2>&1 || true; rm -f \"$pid_file\"; fi\n",
+        .{pid_path_q},
+    );
+    defer allocator.free(stop_script);
+    try writeExecutableFileAtomic(stop_path, stop_script);
+
+    const meta = try std.fmt.allocPrint(
+        allocator,
+        "node_type=9\nnode_rev={d}\nlinux_ver={s}\nss_basic_tfo={s}\nserver_resolv_mode={s}\nserver_resolver={s}\nbuilder=native\nbuilder_reason=native\nhas_start=1\nhas_stop=1\nstart_port={s}\nbuilt_at={d}\n",
+        .{ node.rev, runtime_cfg.linux_ver, runtime_cfg.tfo, runtime_cfg.resolv_mode, runtime_cfg.resolver, port_text, std.time.timestamp() },
     );
     defer allocator.free(meta);
     try writeFileAtomic(meta_path, meta);
@@ -5614,29 +5736,27 @@ fn writeWebtestGlobalMeta(allocator: std.mem.Allocator, socket_path: []const u8,
     const linux_ver = try linuxVerStringAlloc(allocator);
     defer allocator.free(linux_ver);
 
-    const content = try std.fmt.allocPrint(allocator,
-        "cache_rev=1\n" ++
-            "gen_rev=" ++ webtest_cache_gen_rev ++ "\n" ++
-            "profile={s}\n" ++
-            "linux_ver={s}\n" ++
-            "ss_basic_tfo={s}\n" ++
-            "server_resolv_mode={s}\n" ++
-            "server_resolver={s}\n" ++
-            "node_config_ts={s}\n" ++
-            "xray_count={d}\n" ++
-            "xray_ids_md5={s}\n" ++
-            "built_at={d}\n",
-        .{
-            profile,
-            linux_ver,
-            if (tfo.len > 0) tfo else "0",
-            if (std.mem.eql(u8, resolv_mode_raw, "2")) "2" else "1",
-            if (server_resolver.len > 0) server_resolver else "-1",
-            if (node_config_ts.len > 0) node_config_ts else "0",
-            ids.len,
-            ids_md5,
-            std.time.timestamp(),
-        });
+    const content = try std.fmt.allocPrint(allocator, "cache_rev=1\n" ++
+        "gen_rev=" ++ webtest_cache_gen_rev ++ "\n" ++
+        "profile={s}\n" ++
+        "linux_ver={s}\n" ++
+        "ss_basic_tfo={s}\n" ++
+        "server_resolv_mode={s}\n" ++
+        "server_resolver={s}\n" ++
+        "node_config_ts={s}\n" ++
+        "xray_count={d}\n" ++
+        "xray_ids_md5={s}\n" ++
+        "built_at={d}\n", .{
+        profile,
+        linux_ver,
+        if (tfo.len > 0) tfo else "0",
+        if (std.mem.eql(u8, resolv_mode_raw, "2")) "2" else "1",
+        if (server_resolver.len > 0) server_resolver else "-1",
+        if (node_config_ts.len > 0) node_config_ts else "0",
+        ids.len,
+        ids_md5,
+        std.time.timestamp(),
+    });
     defer allocator.free(content);
     try writeFileAtomic(path, content);
 }
@@ -5851,6 +5971,7 @@ fn normalizeLegacyB64Fields(arena: std.mem.Allocator, obj: *std.json.ObjectMap, 
 
     try maybeDecodeLegacyB64Field(arena, obj, "password", false);
     try maybeDecodeLegacyB64Field(arena, obj, "naive_pass", false);
+    try maybeDecodeLegacyB64Field(arena, obj, "anytls_pass", false);
     try maybeDecodeLegacyB64Field(arena, obj, "v2ray_json", true);
     try maybeDecodeLegacyB64Field(arena, obj, "xray_json", true);
     try maybeDecodeLegacyB64Field(arena, obj, "tuic_json", true);
@@ -6264,6 +6385,7 @@ fn protocolInfo(type_id: []const u8, xray_prot: []const u8) struct { short: []co
     if (std.mem.eql(u8, type_id, "6")) return .{ .short = "naive", .label = "Naive" };
     if (std.mem.eql(u8, type_id, "7")) return .{ .short = "tuic", .label = "TUIC" };
     if (std.mem.eql(u8, type_id, "8")) return .{ .short = "hysteria2", .label = "Hysteria2" };
+    if (std.mem.eql(u8, type_id, "9")) return .{ .short = "anytls", .label = "AnyTLS" };
     return .{ .short = "unknown", .label = "Unknown" };
 }
 
@@ -6274,6 +6396,9 @@ fn effectiveEndpoint(value: NodeJson) struct { server: []const u8, port: []const
         }
         if (std.mem.eql(u8, type_id, "8")) {
             return .{ .server = value.hy2_server orelse "", .port = value.hy2_port orelse "" };
+        }
+        if (std.mem.eql(u8, type_id, "9")) {
+            return .{ .server = value.anytls_server orelse "", .port = value.anytls_port orelse "" };
         }
     }
     return .{ .server = value.server orelse "", .port = value.port orelse "" };
@@ -6735,36 +6860,36 @@ fn writeJsonString(writer: anytype, input: []const u8) !void {
 fn printUsage(writer: anytype) !void {
     try writer.writeAll(
         "Usage:\n" ++
-        "  node-tool list [options]\n" ++
-        "  node-tool stat [options]\n" ++
-        "  node-tool find [options]\n" ++
-        "  node-tool current-env [options]\n" ++
-        "  node-tool airport-domains [options]\n" ++
-        "  node-tool find-duplicates [options]\n" ++
-        "  node-tool export-sources [options]\n" ++
-        "  node-tool prune-export-sources [options]\n" ++
-        "  node-tool webtest-groups [options]\n" ++
-        "  node-tool node2json [options]\n" ++
-        "  node-tool sync-source [options]\n" ++
-        "  node-tool json2node [options]\n" ++
-        "  node-tool add-node [options]\n" ++
-        "  node-tool delete-node [options]\n" ++
-        "  node-tool delete-nodes [options]\n" ++
-        "  node-tool dedupe [options]\n" ++
-        "  node-tool compact-ids [options]\n" ++
-        "  node-tool warm-cache [options]\n" ++
-        "  node-tool runtime-artifact [options]\n" ++
-        "  node-tool reorder [options]\n" ++
-        "  node-tool plan [options]\n" ++
-        "  node-tool migrate-legacy [options]\n" ++
-        "  node-tool version\n",
+            "  node-tool list [options]\n" ++
+            "  node-tool stat [options]\n" ++
+            "  node-tool find [options]\n" ++
+            "  node-tool current-env [options]\n" ++
+            "  node-tool airport-domains [options]\n" ++
+            "  node-tool find-duplicates [options]\n" ++
+            "  node-tool export-sources [options]\n" ++
+            "  node-tool prune-export-sources [options]\n" ++
+            "  node-tool webtest-groups [options]\n" ++
+            "  node-tool node2json [options]\n" ++
+            "  node-tool sync-source [options]\n" ++
+            "  node-tool json2node [options]\n" ++
+            "  node-tool add-node [options]\n" ++
+            "  node-tool delete-node [options]\n" ++
+            "  node-tool delete-nodes [options]\n" ++
+            "  node-tool dedupe [options]\n" ++
+            "  node-tool compact-ids [options]\n" ++
+            "  node-tool warm-cache [options]\n" ++
+            "  node-tool runtime-artifact [options]\n" ++
+            "  node-tool reorder [options]\n" ++
+            "  node-tool plan [options]\n" ++
+            "  node-tool migrate-legacy [options]\n" ++
+            "  node-tool version\n",
     );
 }
 
 fn printCommandUsage(command: Command, writer: anytype) !void {
     switch (command) {
         .list => try writer.writeAll("Usage: node-tool list [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format table|json|jsonl] [--socket path]\n"),
-        .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
+        .stat => try writer.writeAll("Usage: node-tool stat [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--effective] [--airport-identity value] [--protocol type] [--name keyword] [--identity value] [--format text|json|summary] [--socket path]\n"),
         .find => try writer.writeAll("Usage: node-tool find [--name keyword] [--identity value] [--source-tag tag] [--profile-id value] [--airport-identity value] [--protocol type] [--format table|json|jsonl] [--socket path]\n"),
         .current_env => try writer.writeAll("Usage: node-tool current-env [--ids 23 | --identity xxx_yyy] [--fields name,type,server] [--socket path]\n"),
         .airport_domains => try writer.writeAll("Usage: node-tool airport-domains [--ids 1,2,3] [--source user|subscribe] [--source-tag tag] [--profile-id value] [--airport-identity value] [--group name] [--protocol type] [--name keyword] [--identity value] [--format text|json] [--socket path]\n"),
