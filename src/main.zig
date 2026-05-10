@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.12";
+const app_version = "0.1.13";
 const webtest_cache_gen_rev = "20260503_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -2815,6 +2815,80 @@ fn allocJsonStringOrEmpty(allocator: std.mem.Allocator, value: ?[]const u8) ![]u
     return try allocator.dupe(u8, "\"\"");
 }
 
+fn allocWebSocketSettingsJson(allocator: std.mem.Allocator, path: ?[]const u8, host: ?[]const u8) ![]u8 {
+    const path_json = try allocJsonStringOrNull(allocator, path);
+    defer allocator.free(path_json);
+    const host_json = try allocJsonStringOrNull(allocator, host);
+    defer allocator.free(host_json);
+    return try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json });
+}
+
+fn allocHy2Congestion(allocator: std.mem.Allocator, up: ?[]const u8, dl: ?[]const u8, cg: ?[]const u8) ![]u8 {
+    const has_up = up != null and up.?.len > 0;
+    const has_dl = dl != null and dl.?.len > 0;
+    if (has_up and has_dl) {
+        if (cg != null and cg.?.len > 0) return try allocator.dupe(u8, cg.?);
+        return try allocator.dupe(u8, "brutal");
+    }
+    if (!has_up and !has_dl) return try allocator.dupe(u8, "bbr");
+    if (cg != null and cg.?.len > 0) return try allocator.dupe(u8, cg.?);
+    return try allocator.dupe(u8, "bbr");
+}
+
+fn allocHy2FinalmaskJson(allocator: std.mem.Allocator, up: ?[]const u8, dl: ?[]const u8, cg: ?[]const u8, hy2_port_value: []const u8, has_port_range: bool, obfs: ?[]const u8, obfs_pass: ?[]const u8) ![]u8 {
+    const has_up = up != null and up.?.len > 0;
+    const has_dl = dl != null and dl.?.len > 0;
+    const has_obfs = obfs != null and std.mem.eql(u8, obfs.?, "1") and obfs_pass != null and obfs_pass.?.len > 0;
+
+    const congestion = try allocHy2Congestion(allocator, up, dl, cg);
+    defer allocator.free(congestion);
+    const has_quic_params = congestion.len > 0 or has_up or has_dl or has_port_range;
+    if (!has_quic_params and !has_obfs) return try allocator.dupe(u8, "");
+
+    const up_value = if (has_up) try std.fmt.allocPrint(allocator, "{s}mbps", .{up.?}) else try allocator.dupe(u8, "");
+    defer allocator.free(up_value);
+    const dl_value = if (has_dl) try std.fmt.allocPrint(allocator, "{s}mbps", .{dl.?}) else try allocator.dupe(u8, "");
+    defer allocator.free(dl_value);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeAll(",\n    \"finalmask\": {");
+
+    var wrote_field = false;
+    if (has_quic_params) {
+        try writer.writeAll("\"quicParams\": {");
+        var wrote_quic_param = false;
+        if (congestion.len > 0) {
+            try writer.print("\"congestion\": \"{s}\"", .{congestion});
+            wrote_quic_param = true;
+        }
+        if (has_up) {
+            if (wrote_quic_param) try writer.writeAll(", ");
+            try writer.print("\"brutalUp\": \"{s}\"", .{up_value});
+            wrote_quic_param = true;
+        }
+        if (has_dl) {
+            if (wrote_quic_param) try writer.writeAll(", ");
+            try writer.print("\"brutalDown\": \"{s}\"", .{dl_value});
+            wrote_quic_param = true;
+        }
+        if (has_port_range) {
+            if (wrote_quic_param) try writer.writeAll(", ");
+            try writer.print("\"udpHop\": {{\"ports\": \"{s}\", \"interval\": 30}}", .{hy2_port_value});
+        }
+        try writer.writeByte('}');
+        wrote_field = true;
+    }
+
+    if (has_obfs) {
+        if (wrote_field) try writer.writeAll(", ");
+        try writer.print("\"udp\": [{{\"type\": \"salamander\", \"settings\": {{\"password\": \"{s}\"}}}}]", .{obfs_pass.?});
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn isIpLiteral(host: []const u8) bool {
     _ = std.net.Address.parseIp(host, 0) catch return false;
     return true;
@@ -4962,14 +5036,7 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     defer allocator.free(tls_json);
 
     const ws_json = if (std.mem.eql(u8, net, "ws")) ws: {
-        const path_json = try allocJsonStringOrNull(allocator, path);
-        defer allocator.free(path_json);
-        const headers_json = if (host != null and host.?.len > 0)
-            try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
-        else
-            try allocator.dupe(u8, "null");
-        defer allocator.free(headers_json);
-        break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
+        break :ws try allocWebSocketSettingsJson(allocator, path, host);
     } else try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
 
@@ -5280,14 +5347,7 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     defer allocator.free(reality_json);
 
     const ws_json = if (std.mem.eql(u8, net, "ws")) ws: {
-        const path_json = try allocJsonStringOrNull(allocator, path);
-        defer allocator.free(path_json);
-        const headers_json = if (host != null and host.?.len > 0)
-            try std.fmt.allocPrint(allocator, "{{\"Host\":\"{s}\"}}", .{host.?})
-        else
-            try allocator.dupe(u8, "null");
-        defer allocator.free(headers_json);
-        break :ws try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"headers\":{s}}}", .{ path_json, headers_json });
+        break :ws try allocWebSocketSettingsJson(allocator, path, host);
     } else try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
     const grpc_json = if (std.mem.eql(u8, net, "grpc")) grpc: {
@@ -5396,7 +5456,7 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
     const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and tfo != null and std.mem.eql(u8, tfo.?, "1");
     const allow_insecure = ai != null and std.mem.eql(u8, ai.?, "1");
     const ws_json = if (is_ws)
-        try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"headers\":{{\"Host\":\"{s}\"}}}}", .{ if (obfsuri) |value| value else "", if (obfshost) |value| value else "" })
+        try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"host\":\"{s}\"}}", .{ if (obfsuri) |value| value else "", if (obfshost) |value| value else "" })
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(ws_json);
@@ -5487,19 +5547,7 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     else
         try allocator.dupe(u8, hy2_port_value);
     defer allocator.free(settings_port_literal);
-    const udphop_port_literal = if (has_port_range)
-        try std.fmt.allocPrint(allocator, "\"{s}\"", .{hy2_port_value})
-    else
-        try allocator.dupe(u8, "\"\"");
-    defer allocator.free(udphop_port_literal);
-    const up_value = if (up) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
-    defer allocator.free(up_value);
-    const dl_value = if (dl) |value| try std.fmt.allocPrint(allocator, "{s}mbps", .{value}) else try allocator.dupe(u8, "");
-    defer allocator.free(dl_value);
-    const finalmask_value = if (obfs != null and std.mem.eql(u8, obfs.?, "1") and obfs_pass != null and obfs_pass.?.len > 0)
-        try std.fmt.allocPrint(allocator, ",\n    \"finalmask\": {{\"udp\": [{{\"type\": \"salamander\", \"settings\": {{\"password\": \"{s}\"}}}}]}}", .{obfs_pass.?})
-    else
-        try allocator.dupe(u8, "");
+    const finalmask_value = try allocHy2FinalmaskJson(allocator, up, dl, cg, hy2_port_value, has_port_range, obfs, obfs_pass);
     defer allocator.free(finalmask_value);
     const out_json = try std.fmt.allocPrint(
         allocator,
@@ -5509,7 +5557,7 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
             "  \"settings\": {{\"version\": 2, \"address\": \"{s}\", \"port\": {s}}},\n" ++
             "  \"streamSettings\": {{\n" ++
             "    \"network\": \"hysteria\",\n" ++
-            "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\", \"congestion\": \"{s}\", \"up\": \"{s}\", \"down\": \"{s}\", \"udphop\": {{\"port\": {s}, \"interval\": 30}}}},\n" ++
+            "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\"}},\n" ++
             "    \"security\": \"tls\",\n" ++
             "    \"tlsSettings\": {{\"serverName\": \"{s}\", \"pinnedPeerCertSha256\": \"{s}\", \"verifyPeerCertByName\": \"{s}\", \"allowInsecure\": {s}, \"alpn\": [\"h3\"]}},\n" ++
             "    \"sockopt\": {{\"tcpFastOpen\": {s}}}{s}\n" ++
@@ -5520,10 +5568,6 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
             node.server,
             settings_port_literal,
             pass.?,
-            if (cg) |value| value else "bbr",
-            up_value,
-            dl_value,
-            udphop_port_literal,
             if (sni) |value| value else node.server,
             if (pcs) |value| value else "",
             if (vcn) |value| value else "",
