@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const app_version = "0.1.13";
-const webtest_cache_gen_rev = "20260503_1";
+const app_version = "0.1.14";
+const webtest_cache_gen_rev = "20260513_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
@@ -2823,6 +2823,18 @@ fn allocWebSocketSettingsJson(allocator: std.mem.Allocator, path: ?[]const u8, h
     return try std.fmt.allocPrint(allocator, "{{\"path\":{s},\"host\":{s}}}", .{ path_json, host_json });
 }
 
+fn allocSsHttpObfsTcpSettingsJson(allocator: std.mem.Allocator, host: ?[]const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeAll("{\"header\":{\"type\":\"http\",\"request\":{\"version\":\"1.1\",\"method\":\"GET\",\"path\":[\"/\"],\"headers\":{\"Host\":[");
+    if (host) |value| {
+        if (value.len > 0) try writeJsonString(writer, value);
+    }
+    try writer.writeAll("],\"User-Agent\":[\"Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.75 Safari/537.36\"],\"Accept-Encoding\":[\"gzip, deflate\"],\"Connection\":[\"keep-alive\"],\"Pragma\":[\"no-cache\"]}}}}");
+    return try out.toOwnedSlice(allocator);
+}
+
 fn allocHy2Congestion(allocator: std.mem.Allocator, up: ?[]const u8, dl: ?[]const u8, cg: ?[]const u8) ![]u8 {
     const has_up = up != null and up.?.len > 0;
     const has_dl = dl != null and dl.?.len > 0;
@@ -4028,6 +4040,24 @@ fn containsSsObfs(raw_json: []const u8) bool {
     return std.mem.eql(u8, value.string, "http") or std.mem.eql(u8, value.string, "tls");
 }
 
+fn containsSsTlsObfs(raw_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, raw_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("ss_obfs") orelse return false;
+    if (value != .string) return false;
+    return std.mem.eql(u8, value.string, "tls");
+}
+
+fn shuntSupportsSsObfs(raw_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.c_allocator, raw_json, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .object) return true;
+    const value = parsed.value.object.get("ss_obfs") orelse return true;
+    if (value != .string) return true;
+    return value.string.len == 0 or std.mem.eql(u8, value.string, "0") or std.mem.eql(u8, value.string, "http");
+}
+
 fn looksLikeDomain(host: []const u8) bool {
     if (host.len == 0) return false;
     if (std.mem.indexOfScalar(u8, host, ':') != null) return false;
@@ -4117,7 +4147,7 @@ fn buildWebtestObfsStartPortMap(allocator: std.mem.Allocator, ids_file: []const 
         const idx = findNodeIndexById(nodes, node_id) orelse continue;
         const node = nodes[idx];
         if (std.mem.eql(u8, node.type_id, "0")) {
-            if (!containsSsObfs(node.raw_json)) continue;
+            if (!containsSsTlsObfs(node.raw_json)) continue;
         } else if (!std.mem.eql(u8, node.type_id, "9")) {
             continue;
         }
@@ -4676,7 +4706,7 @@ fn webtestNativeFallbackReason(allocator: std.mem.Allocator, node: NodeRecord, o
         if (ss_obfs) |value| {
             if (value.len > 0 and !std.mem.eql(u8, value, "0")) {
                 if (!std.mem.eql(u8, value, "http") and !std.mem.eql(u8, value, "tls")) return "ss_obfs_mode_unsupported";
-                if (obfs_start_port == null) return "ss_obfs_port_unavailable";
+                if (std.mem.eql(u8, value, "tls") and obfs_start_port == null) return "ss_obfs_port_unavailable";
             }
         }
         return "native_supported";
@@ -4780,7 +4810,7 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         null;
     if (obfs_mode) |value| {
         if (!std.mem.eql(u8, value, "http") and !std.mem.eql(u8, value, "tls")) return false;
-        if (obfs_start_port == null) return false;
+        if (std.mem.eql(u8, value, "tls") and obfs_start_port == null) return false;
     }
 
     const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
@@ -4793,12 +4823,25 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
     defer allocator.free(stop_path);
 
     const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and std.mem.eql(u8, runtime_cfg.tfo, "1");
-    const target_addr = if (obfs_mode != null) "127.0.0.1" else node.server;
-    const target_port = if (obfs_mode != null)
+    const obfs_is_http = obfs_mode != null and std.mem.eql(u8, obfs_mode.?, "http");
+    const obfs_is_tls = obfs_mode != null and std.mem.eql(u8, obfs_mode.?, "tls");
+    const target_addr = if (obfs_is_tls) "127.0.0.1" else node.server;
+    const target_port = if (obfs_is_tls)
         try std.fmt.allocPrint(allocator, "{d}", .{obfs_start_port.?})
     else
         try allocator.dupe(u8, node.port);
     defer allocator.free(target_port);
+    const network = if (obfs_is_http) "tcp" else "raw";
+    const tcp_settings = if (obfs_is_http)
+        try allocSsHttpObfsTcpSettingsJson(allocator, ss_obfs_host)
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(tcp_settings);
+    const tcp_settings_line = if (obfs_is_http)
+        try std.fmt.allocPrint(allocator, ",\n    \"tcpSettings\": {s}\n", .{tcp_settings})
+    else
+        try allocator.dupe(u8, "\n");
+    defer allocator.free(tcp_settings_line);
 
     const out_json = try std.fmt.allocPrint(allocator, "{{\n" ++
         "  \"tag\": \"proxy{s}\",\n" ++
@@ -4813,7 +4856,7 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         "    }}]\n" ++
         "  }},\n" ++
         "  \"streamSettings\": {{\n" ++
-        "    \"network\": \"raw\"\n" ++
+        "    \"network\": \"{s}\"{s}" ++
         "  }},\n" ++
         "  \"sockopt\": {{\n" ++
         "    \"tcpFastOpen\": {s},\n" ++
@@ -4827,12 +4870,15 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         password.?,
         method.?,
         if (obfs_mode != null) "true" else "false",
+        network,
+        tcp_settings_line,
         if (tcp_fast_open) "true" else "false",
     });
     defer allocator.free(out_json);
     try writeFileAtomic(out_path, out_json);
 
-    if (obfs_mode) |value| {
+    if (obfs_is_tls) {
+        const value = obfs_mode.?;
         const server_quoted = try shellQuoteAlloc(allocator, node.server);
         defer allocator.free(server_quoted);
         const remote_port_quoted = try shellQuoteAlloc(allocator, node.port);
@@ -4906,9 +4952,9 @@ fn buildWebtestSsNative(allocator: std.mem.Allocator, node: NodeRecord, node_dir
         runtime_cfg.tfo,
         runtime_cfg.resolv_mode,
         runtime_cfg.resolver,
-        if (obfs_mode != null) "1" else "0",
-        if (obfs_mode != null) "1" else "0",
-        if (obfs_mode != null) target_port else "",
+        if (obfs_is_tls) "1" else "0",
+        if (obfs_is_tls) "1" else "0",
+        if (obfs_is_tls) target_port else "",
         std.time.timestamp(),
     });
     defer allocator.free(meta);
@@ -5701,7 +5747,7 @@ fn isWebtestXrayLike(node: NodeRecord) bool {
 
 fn isShuntRuntimeSupported(node: NodeRecord) bool {
     if (std.mem.eql(u8, node.type_id, "0")) {
-        return !containsSsObfs(node.raw_json);
+        return shuntSupportsSsObfs(node.raw_json);
     }
     return std.mem.eql(u8, node.type_id, "3") or
         std.mem.eql(u8, node.type_id, "4") or
