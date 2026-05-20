@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const app_version = "0.1.14";
+const app_version = "0.1.15";
 const webtest_cache_gen_rev = "20260513_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
@@ -546,6 +546,8 @@ const ImportHints = struct {
     identity: ?[]u8 = null,
     identity_primary: ?[]u8 = null,
     identity_secondary: ?[]u8 = null,
+    profile_id: []u8 = "",
+    name: []u8 = "",
     source_scope: ?[]u8 = null,
 
     fn deinit(self: *ImportHints, allocator: std.mem.Allocator) void {
@@ -553,6 +555,8 @@ const ImportHints = struct {
         if (self.identity) |value| allocator.free(value);
         if (self.identity_primary) |value| allocator.free(value);
         if (self.identity_secondary) |value| allocator.free(value);
+        if (self.profile_id.len > 0) allocator.free(self.profile_id);
+        if (self.name.len > 0) allocator.free(self.name);
         if (self.source_scope) |value| allocator.free(value);
     }
 };
@@ -2377,12 +2381,44 @@ fn findUniqueNodeIndexByScopeSecondary(nodes: []const NodeRecord, source_scope: 
     return found;
 }
 
+fn findUniqueNodeIndexByProfileSecondary(nodes: []const NodeRecord, profile_id: []const u8, secondary: []const u8) ?usize {
+    if (profile_id.len == 0 or secondary.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (!std.mem.eql(u8, node.profile_id, profile_id)) continue;
+        if (!std.mem.eql(u8, node.identity_secondary, secondary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn findUniqueNodeIndexByProfileName(nodes: []const NodeRecord, profile_id: []const u8, name: []const u8) ?usize {
+    if (profile_id.len == 0 or name.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (!std.mem.eql(u8, node.profile_id, profile_id)) continue;
+        if (!std.mem.eql(u8, node.name, name)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
 fn resolveReusableNodeIndex(nodes: []const NodeRecord, hints: ImportHints) ?usize {
     if (hints.preferred_id) |value| {
         if (findNodeIndexById(nodes, value)) |idx| return idx;
     }
     if (hints.identity) |value| {
         if (findNodeIndexByIdentity(nodes, value)) |idx| return idx;
+    }
+    if (hints.profile_id.len > 0) {
+        if (hints.name.len > 0) {
+            if (findUniqueNodeIndexByProfileName(nodes, hints.profile_id, hints.name)) |idx| return idx;
+        }
+        if (hints.identity_secondary) |secondary| {
+            if (findUniqueNodeIndexByProfileSecondary(nodes, hints.profile_id, secondary)) |idx| return idx;
+        }
     }
     if (hints.source_scope) |scope| {
         if (hints.identity_secondary) |secondary| {
@@ -3276,6 +3312,32 @@ fn findUniqueUnusedByScopeSecondary(nodes: []const NodeRecord, used: []bool, sou
     return found;
 }
 
+fn findUniqueUnusedByProfileSecondary(nodes: []const NodeRecord, used: []bool, profile_id: []const u8, secondary: []const u8) ?usize {
+    if (profile_id.len == 0 or secondary.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (used[idx]) continue;
+        if (!std.mem.eql(u8, node.profile_id, profile_id)) continue;
+        if (!std.mem.eql(u8, node.identity_secondary, secondary)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
+fn findUniqueUnusedByProfileName(nodes: []const NodeRecord, used: []bool, profile_id: []const u8, name: []const u8) ?usize {
+    if (profile_id.len == 0 or name.len == 0) return null;
+    var found: ?usize = null;
+    for (nodes, 0..) |node, idx| {
+        if (used[idx]) continue;
+        if (!std.mem.eql(u8, node.profile_id, profile_id)) continue;
+        if (!std.mem.eql(u8, node.name, name)) continue;
+        if (found != null) return null;
+        found = idx;
+    }
+    return found;
+}
+
 fn buildReferenceMappings(allocator: std.mem.Allocator, old_nodes: []const NodeRecord, new_nodes: []const NodeRecord, mappings: *std.ArrayList(ReconcileMapItem), unmapped: *std.ArrayList(ReconcileMapItem)) !void {
     var old_used = try allocator.alloc(bool, old_nodes.len);
     defer allocator.free(old_used);
@@ -3296,6 +3358,24 @@ fn buildReferenceMappings(allocator: std.mem.Allocator, old_nodes: []const NodeR
         if (old_used[old_idx]) continue;
         if (findUniqueUnusedByPrimary(new_nodes, new_used, old_node.identity_primary)) |new_idx| {
             try mappings.append(allocator, try makeReconcileMapItem(allocator, "primary", old_node, new_nodes[new_idx]));
+            old_used[old_idx] = true;
+            new_used[new_idx] = true;
+        }
+    }
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (old_used[old_idx]) continue;
+        if (findUniqueUnusedByProfileName(new_nodes, new_used, old_node.profile_id, old_node.name)) |new_idx| {
+            try mappings.append(allocator, try makeReconcileMapItem(allocator, "profile_name", old_node, new_nodes[new_idx]));
+            old_used[old_idx] = true;
+            new_used[new_idx] = true;
+        }
+    }
+
+    for (old_nodes, 0..) |old_node, old_idx| {
+        if (old_used[old_idx]) continue;
+        if (findUniqueUnusedByProfileSecondary(new_nodes, new_used, old_node.profile_id, old_node.identity_secondary)) |new_idx| {
+            try mappings.append(allocator, try makeReconcileMapItem(allocator, "profile_secondary", old_node, new_nodes[new_idx]));
             old_used[old_idx] = true;
             new_used[new_idx] = true;
         }
@@ -6008,7 +6088,9 @@ fn normalizeNodeJsonForWriteAlloc(allocator: std.mem.Allocator, raw_json: []cons
             }
         }
         if (airport_identity.len == 0) airport_identity = try slugifyAlloc(arena, if (group.len > 0) group else "sub", "sub");
-        if (source_scope.len == 0) {
+        if (profile_id.len > 0) {
+            source_scope = try std.fmt.allocPrint(arena, "profile_{s}", .{profile_id});
+        } else if (source_scope.len == 0) {
             source_scope = if (source_url_hash.len > 0)
                 try std.fmt.allocPrint(arena, "{s}_{s}", .{ airport_identity, source_url_hash })
             else
@@ -6264,6 +6346,8 @@ fn extractImportHints(allocator: std.mem.Allocator, raw_json: []const u8) !Impor
         .identity = try extractStringFieldAlloc(allocator, raw_json, "_identity"),
         .identity_primary = try extractStringFieldAlloc(allocator, raw_json, "_identity_primary"),
         .identity_secondary = try extractStringFieldAlloc(allocator, raw_json, "_identity_secondary"),
+        .profile_id = (try extractStringFieldAlloc(allocator, raw_json, "_profile_id")) orelse "",
+        .name = (try extractStringFieldAlloc(allocator, raw_json, "name")) orelse "",
         .source_scope = try extractStringFieldAlloc(allocator, raw_json, "_source_scope"),
     };
 }
