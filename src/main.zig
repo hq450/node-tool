@@ -1,7 +1,7 @@
 const std = @import("std");
 
-const app_version = "0.1.15";
-const webtest_cache_gen_rev = "20260513_1";
+const app_version = "0.1.16";
+const webtest_cache_gen_rev = "20260601_1";
 const skipd_socket_path_default = "/tmp/.skipd_server_sock";
 const skipd_magic = "magicv1 ";
 const skipd_header_prefix = 16;
@@ -5099,8 +5099,6 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     defer if (grpc_mode) |value| allocator.free(value);
     const security_sni = try extractStringFieldAlloc(allocator, node.raw_json, "v2ray_network_security_sni");
     defer if (security_sni) |value| allocator.free(value);
-    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "v2ray_network_security_ai");
-    defer if (ai) |value| allocator.free(value);
     const alpn_h2 = try extractStringFieldAlloc(allocator, node.raw_json, "v2ray_network_security_alpn_h2");
     defer if (alpn_h2) |value| allocator.free(value);
     const alpn_http = try extractStringFieldAlloc(allocator, node.raw_json, "v2ray_network_security_alpn_http");
@@ -5150,9 +5148,8 @@ fn buildWebtestVmessNative(allocator: std.mem.Allocator, node: NodeRecord, node_
     const tls_json = if (std.mem.eql(u8, sec, "tls"))
         try std.fmt.allocPrint(
             allocator,
-            "{{\"allowInsecure\":{s},\"alpn\":{s},\"serverName\":{s}}}",
+            "{{\"alpn\":{s},\"serverName\":{s}}}",
             .{
-                if (ai != null and std.mem.eql(u8, ai.?, "1")) "true" else "false",
                 alpn_json,
                 sni_json,
             },
@@ -5348,8 +5345,6 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     defer if (grpc_mode) |value| allocator.free(value);
     const security_sni = try extractStringFieldAlloc(allocator, node.raw_json, "xray_network_security_sni");
     defer if (security_sni) |value| allocator.free(value);
-    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "xray_network_security_ai");
-    defer if (ai) |value| allocator.free(value);
     const alpn_h2 = try extractStringFieldAlloc(allocator, node.raw_json, "xray_network_security_alpn_h2");
     defer if (alpn_h2) |value| allocator.free(value);
     const alpn_http = try extractStringFieldAlloc(allocator, node.raw_json, "xray_network_security_alpn_http");
@@ -5441,14 +5436,13 @@ fn buildWebtestXrayNative(allocator: std.mem.Allocator, node: NodeRecord, node_d
     const tls_json = if (std.mem.eql(u8, sec, "tls"))
         try std.fmt.allocPrint(
             allocator,
-            "{{\"allowInsecure\":{s},\"alpn\":{s},\"serverName\":{s},\"fingerprint\":{s},\"pinnedPeerCertSha256\":{s},\"verifyPeerCertByName\":{s}}}",
+            "{{\"alpn\":{s},\"serverName\":{s},\"fingerprint\":{s},\"pinnedPeerCertSha256\":{s},\"verifyPeerCertByName\":{s}}}",
             .{
-                if (ai != null and std.mem.eql(u8, ai.?, "1")) "true" else "null",
                 alpn_json,
                 sni_json,
                 fingerprint_json,
-                if (ai != null and std.mem.eql(u8, ai.?, "1")) "null" else pcs_json,
-                if (ai != null and std.mem.eql(u8, ai.?, "1")) "null" else vcn_json,
+                pcs_json,
+                vcn_json,
             },
         )
     else
@@ -5561,8 +5555,6 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
     defer if (pcs) |value| allocator.free(value);
     const vcn = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_vcn");
     defer if (vcn) |value| allocator.free(value);
-    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_ai");
-    defer if (ai) |value| allocator.free(value);
     const tfo = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_tfo");
     defer if (tfo) |value| allocator.free(value);
     const plugin = try extractStringFieldAlloc(allocator, node.raw_json, "trojan_plugin");
@@ -5580,7 +5572,6 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
     const meta_path = try std.fmt.allocPrint(allocator, "{s}/{s}.meta", .{ meta_dir, node.id });
     defer allocator.free(meta_path);
     const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and tfo != null and std.mem.eql(u8, tfo.?, "1");
-    const allow_insecure = ai != null and std.mem.eql(u8, ai.?, "1");
     const ws_json = if (is_ws)
         try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"host\":\"{s}\"}}", .{ if (obfsuri) |value| value else "", if (obfshost) |value| value else "" })
     else
@@ -5600,8 +5591,7 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
             "    \"tlsSettings\": {{\n" ++
             "      \"serverName\": \"{s}\",\n" ++
             "      \"pinnedPeerCertSha256\": \"{s}\",\n" ++
-            "      \"verifyPeerCertByName\": \"{s}\",\n" ++
-            "      \"allowInsecure\": {s}\n" ++
+            "      \"verifyPeerCertByName\": \"{s}\"\n" ++
             "    }},\n" ++
             "    \"wsSettings\": {s},\n" ++
             "    \"sockopt\": {{\"tcpFastOpen\": {s}}}\n" ++
@@ -5616,7 +5606,6 @@ fn buildWebtestTrojanNative(allocator: std.mem.Allocator, node: NodeRecord, node
             if (sni) |value| value else "",
             if (pcs) |value| value else "",
             if (vcn) |value| value else "",
-            if (allow_insecure) "true" else "false",
             ws_json,
             if (tcp_fast_open) "true" else "false",
         },
@@ -5654,13 +5643,10 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
     defer if (pcs) |value| allocator.free(value);
     const vcn = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_vcn");
     defer if (vcn) |value| allocator.free(value);
-    const ai = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_ai");
-    defer if (ai) |value| allocator.free(value);
     const tfo = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_tfo");
     defer if (tfo) |value| allocator.free(value);
     const cg = try extractStringFieldAlloc(allocator, node.raw_json, "hy2_cg");
     defer if (cg) |value| allocator.free(value);
-    const allow_insecure = ai != null and std.mem.eql(u8, ai.?, "1");
     const tcp_fast_open = !std.mem.eql(u8, runtime_cfg.linux_ver, "26") and tfo != null and std.mem.eql(u8, tfo.?, "1");
     const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}_outbounds.json", .{ node_dir, node.id });
     defer allocator.free(out_path);
@@ -5685,7 +5671,7 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
             "    \"network\": \"hysteria\",\n" ++
             "    \"hysteriaSettings\": {{\"version\": 2, \"auth\": \"{s}\"}},\n" ++
             "    \"security\": \"tls\",\n" ++
-            "    \"tlsSettings\": {{\"serverName\": \"{s}\", \"pinnedPeerCertSha256\": \"{s}\", \"verifyPeerCertByName\": \"{s}\", \"allowInsecure\": {s}, \"alpn\": [\"h3\"]}},\n" ++
+            "    \"tlsSettings\": {{\"serverName\": \"{s}\", \"pinnedPeerCertSha256\": \"{s}\", \"verifyPeerCertByName\": \"{s}\", \"alpn\": [\"h3\"]}},\n" ++
             "    \"sockopt\": {{\"tcpFastOpen\": {s}}}{s}\n" ++
             "  }}\n" ++
             "}}\n",
@@ -5697,7 +5683,6 @@ fn buildWebtestHy2Native(allocator: std.mem.Allocator, node: NodeRecord, node_di
             if (sni) |value| value else node.server,
             if (pcs) |value| value else "",
             if (vcn) |value| value else "",
-            if (allow_insecure) "true" else "false",
             if (tcp_fast_open) "true" else "false",
             finalmask_value,
         },
